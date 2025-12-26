@@ -91,18 +91,36 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
     }
   }
 
-  auto ret = lb_policy_->select_instances_pair(request);
-  DLOG(INFO) << request->routing.debug_string();
-
-  if (ret) {
-    if (!request->routing.prefill_name.empty()) {
-      instance_mgr_->wakeup_model(request->routing.prefill_name, request->model);
-    }
-    if (!request->routing.decode_name.empty() &&
-        request->routing.decode_name != request->routing.prefill_name) {
-      instance_mgr_->wakeup_model(request->routing.decode_name, request->model);
-    }
+  // Update model heat
+  if (request->prompt.size() != 0) {
+    instance_mgr_->update_model_heat(request->model, request->token_ids.size());
   }
+
+  // Check if model is already awake on any instance
+  std::string awake_instance = instance_mgr_->get_awake_instance(request->model);
+  
+  // TODO: support lb_policy based routing among multiple awake instances
+  if (!awake_instance.empty()) {
+      // Model is awake, route to it
+      request->routing.prefill_name = awake_instance;
+      request->routing.decode_name = awake_instance;
+      // You might want to refine this to use load balancing if multiple are awake,
+      // but for now, we pick the first one found.
+  } else {
+      // Model is sleeping everywhere, need to allocate space and wake up
+      std::string allocated_instance = instance_mgr_->allocate_instance_for_model(request->model);
+      if (!allocated_instance.empty()) {
+          request->routing.prefill_name = allocated_instance;
+          request->routing.decode_name = allocated_instance;
+      } else {
+          LOG(ERROR) << "Failed to allocate instance for model " << request->model;
+          return false;
+      }
+  }
+
+  DLOG(INFO) << request->routing.debug_string();
+  
+  bool ret = !request->routing.prefill_name.empty();
 
   // update request metrics
   if (request->prompt.size() != 0) {

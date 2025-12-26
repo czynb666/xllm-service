@@ -22,6 +22,8 @@ limitations under the License.
 #include <chrono>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <algorithm>
+#include <limits>
 
 #include "common/global_gflags.h"
 #include "common/types.h"
@@ -64,6 +66,7 @@ InstanceMgr::InstanceMgr(const Options& options,
 }
 
 void InstanceMgr::init() {
+  init_model_memory_specs();
   {
     std::unique_lock<std::shared_mutex> lock(inst_mutex_);
     for (auto& it : ETCD_KEYS_PREFIX_MAP) {
@@ -213,7 +216,13 @@ std::vector<std::string> InstanceMgr::get_static_prefill_list(
 
 static const std::vector<std::pair<std::string, std::string>> MODELS = {
     {"Qwen3-8B", "/export/home/models/Qwen3-8B"},
-    {"Qwen2-7B", "/export/home/models/Qwen2-7B"}};
+    {"Qwen2-7B", "/export/home/models/Qwen2-7B"},
+    {"Qwen2.5-14B", "/export/home/models/Qwen2.5-14B"},
+    {"Qwen3-4B", "/export/home/models/Qwen3-4B"}
+    // {"Qwen2.5-3b", "/export/home/models/Qwen2.5-3b"}
+    // {"Qwen3-30B-A3B-W8A8", "/export/home/models/Qwen3-30B-A3B-W8A8"},
+    // {"Qwen3-32B-W8A8", "/export/home/models/Qwen3-32B-W8A8"}
+};
 
 static uint16_t master_node_port = 40000;// multithread unsafe yet
 
@@ -239,8 +248,8 @@ void InstanceMgr::fork_master_and_sleep(
     sleep_body["master_status"] = 1;
 
     if (send_http_request(channel, "/sleep", sleep_body.dump())) {
-      std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
-      instance_model_states_[instance_name][model.first] = 1;  // Sleep
+      std::unique_lock<std::shared_mutex> lock(instance_model_state_mutex_);
+      instance_model_states_[instance_name][model.first] = ModelState::SLEEP;  // Sleep
       LOG(INFO) << "Model " << model.first << " on " << instance_name
                 << " is now SLEEPING";
     } else {
@@ -253,9 +262,9 @@ void InstanceMgr::fork_master_and_sleep(
 void InstanceMgr::wakeup_model(const std::string& instance_name,
                                const std::string& model_id) {
   {
-    std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
+    std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
     if (instance_model_states_[instance_name].count(model_id) &&
-        instance_model_states_[instance_name][model_id] == 0) {
+        instance_model_states_[instance_name][model_id] == ModelState::WAKEUP) {
       return;  // Already wakeup
     }
   }
@@ -265,8 +274,8 @@ void InstanceMgr::wakeup_model(const std::string& instance_name,
   wakeup_body["master_status"] = 0;
 
   if (send_http_request(instance_name, "/wakeup", wakeup_body.dump())) {
-    std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
-    instance_model_states_[instance_name][model_id] = 0;  // Wakeup
+    std::unique_lock<std::shared_mutex> lock(instance_model_state_mutex_);
+    instance_model_states_[instance_name][model_id] = ModelState::WAKEUP;  // Wakeup
     LOG(INFO) << "Model " << model_id << " on " << instance_name
               << " is now WAKEUP";
   } else {
@@ -444,9 +453,9 @@ void InstanceMgr::register_instance(const std::string& instance_name,
   }
 
   {
-    std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
+    std::unique_lock<std::shared_mutex> lock(instance_model_state_mutex_);
     instance_model_states_.emplace(instance_name,
-                                   std::unordered_map<std::string, int>());
+                                   std::unordered_map<std::string, ModelState>());
   }
   
   // Note: we can't call fork_master_and_sleep here if we are holding
@@ -454,6 +463,10 @@ void InstanceMgr::register_instance(const std::string& instance_name,
   // get_channel which acquires inst_mutex_ again (deadlock).
   auto channel = cached_channels_[instance_name];
   fork_master_and_sleep(instance_name, channel);
+  {
+    std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
+    instance_memory_usage_[instance_name] = 0.0;
+  }
 
   {
     std::lock_guard<std::mutex> time_predictor_lock(time_predictor_mutex_);
@@ -662,7 +675,7 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
           request_metrics_.erase(iter);
         }
         {
-          std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
+          std::unique_lock<std::shared_mutex> lock(instance_model_state_mutex_);
           instance_model_states_.erase(iter);
         }
         {
@@ -977,9 +990,9 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
     }
 
     {
-      std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
+      std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
       if (instance_model_states_[instance_name].count(model_id) &&
-          instance_model_states_[instance_name][model_id] == 1) {
+          instance_model_states_[instance_name][model_id] == ModelState::SLEEP) {
         LOG(INFO) << "Model " << model_id << " on " << instance_name
                   << " is already sleeping.";
         return;  // Already sleep
@@ -993,8 +1006,16 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
     if (send_http_request(instance_name, "/sleep", sleep_body.dump())) {
       LOG(INFO) << "Model " << model_id << " on " << instance_name
                 << " trigger sleep success.";
-      std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
-      instance_model_states_[instance_name][model_id] = 1;  // Sleep
+      std::unique_lock<std::shared_mutex> inst_lock(instance_model_state_mutex_);
+      std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
+      instance_model_states_[instance_name][model_id] = ModelState::SLEEP;  // Sleep
+      instance_memory_usage_[instance_name] -= get_model_memory_size(model_id);
+      if (instance_memory_usage_[instance_name] < 0) {
+        LOG(WARNING) << "Instance " << instance_name
+                     << " memory usage negative, reset to 0.";
+        instance_memory_usage_[instance_name] = 0;
+      }
+
     } else {
       LOG(ERROR) << "Failed to sleep model " << model_id << " on "
                 << instance_name;
@@ -1003,37 +1024,222 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
   }
 
 void InstanceMgr::send_model_wakeup(const std::string& instance_name,
-                                     const std::string& model_id) {
+                                    const std::string& model_id) {
 
-    if (instance_name.empty() || instance_name == "all") {
-      LOG(ERROR) << "Only support fixed instance_name for model trigger now.";
-      return;
+  if (instance_name.empty() || instance_name == "all") {
+    LOG(ERROR) << "Only support fixed instance_name for model trigger now.";
+    return;
+  }
+  
+  {
+    std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
+    if (instance_model_states_[instance_name].count(model_id) &&
+        instance_model_states_[instance_name][model_id] == ModelState::WAKEUP) {
+      LOG(INFO) << "Model " << model_id << " on " << instance_name
+                << " is already wakeup.";
+      return;  // Already wakeup
     }
+  }
+
+  nlohmann::json wakeup_body;
+  wakeup_body["model_id"] = model_id;
+  wakeup_body["master_status"] = 0;
+
+  if (send_http_request(instance_name, "/wakeup", wakeup_body.dump())) {
+    LOG(INFO) << "Model " << model_id << " on " << instance_name
+              << " trigger wakeup success.";                
+    std::unique_lock<std::shared_mutex> inst_lock(instance_model_state_mutex_);
+    std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
+    instance_model_states_[instance_name][model_id] = ModelState::WAKEUP;  // Wakeup
+    instance_memory_usage_[instance_name] += get_model_memory_size(model_id);
+    if (instance_memory_usage_[instance_name] > kMaxInstanceMemoryGB) {
+      LOG(WARNING) << "Instance " << instance_name
+                   << " memory usage exceeds max limit after waking up model "
+                   << model_id << ".";
+    }
+  } else {
+    LOG(ERROR) << "Failed to wakeup model " << model_id << " on "
+              << instance_name;
+  }
+
+}
+
+void InstanceMgr::init_model_memory_specs() {
+    // Hardcoded memory specs: x * 2 + 5 GB. 5GB = 3GB KV cache + 2GB overhead
+    model_memory_specs_["Qwen3-8B"] = 8.0 * 2 + 5.0;
+    model_memory_specs_["Qwen2-7B"] = 7.0 * 2 + 5.0;
+    model_memory_specs_["Qwen2.5-14B"] = 14.0 * 2 + 5.0;
+    model_memory_specs_["Qwen3-4B"] = 4.0 * 2 + 5.0;
+    model_memory_specs_["Qwen2.5-3b"] = 3.0 * 2 + 5.0;
+    model_memory_specs_["Qwen3-30B-A3B-W8A8"] = 30.0 + 5.0;
+    model_memory_specs_["Qwen3-32B-W8A8"] = 40.0 + 5.0;
+}
+
+// TODO: support dynamic instance memory specs, rather than hardcoded.
+double InstanceMgr::get_model_memory_size(const std::string& model_id) {
+    if (model_memory_specs_.count(model_id)) {
+        return model_memory_specs_[model_id];
+    }
+    LOG(WARNING) << "Unknown model ID for memory spec: " << model_id << ", using default 20GB";
+    return 20.0; 
+}
+
+std::string InstanceMgr::get_awake_instance(const std::string& model_id) {
+  std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
+  for (const auto& instance_pair : instance_model_states_) {
+    const std::string& instance_name = instance_pair.first;
+    const auto& model_states = instance_pair.second;
     
+    if (model_states.count(model_id) && model_states.at(model_id) == ModelState::WAKEUP) { // 0 means awake
+      return instance_name;
+    }
+  }
+  return "";
+}
+
+void InstanceMgr::update_model_heat(const std::string& model_id, int64_t token_count) {
+  std::lock_guard<std::mutex> lock(model_heat_mutex_);
+  global_model_heat_[model_id] += token_count;
+}
+
+std::string InstanceMgr::allocate_instance_for_model(const std::string& model_id) {
+  double model_size = get_model_memory_size(model_id);
+  
+  LOG(INFO) << "Allocating instance for model " << model_id 
+            << " with size " << model_size << " GB.";
+
+  // First, try to find an instance with enough free space
+  {
+    std::unique_lock<std::mutex> mem_lock(instance_memory_mutex_);
+    for (const auto& pair : instance_memory_usage_) {
+      const std::string& instance_name = pair.first;
+      double current_usage = pair.second;
+
+      LOG(INFO) << "Instance " << instance_name 
+                << " current memory usage: " << current_usage << " GB.";
+
+      if (current_usage + model_size <= kMaxInstanceMemoryGB) {
+        mem_lock.unlock();
+        send_model_wakeup(instance_name, model_id);
+        return instance_name;
+      }
+    }
+  }
+
+  // If no instance has enough space, we need to evict.
+  // Strategy: Find the instance where we can free up enough space by evicting the *coldest* models.
+  
+  std::string best_candidate_instance;
+  std::vector<std::string> best_eviction_plan;
+  uint64_t min_evicted_heat_sum = std::numeric_limits<uint64_t>::max();
+
+  std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_); // Iterate instances safely
+  for (const auto& inst_pair : instances_) {
+    std::string instance_name = inst_pair.first;
+    
+    // Check current usage
+    double current_usage = 0;
     {
-      std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
-      if (instance_model_states_[instance_name].count(model_id) &&
-          instance_model_states_[instance_name][model_id] == 0) {
-        LOG(INFO) << "Model " << model_id << " on " << instance_name
-                  << " is already wakeup.";
-        return;  // Already wakeup
+      std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
+      if (instance_memory_usage_.count(instance_name)) {
+        current_usage = instance_memory_usage_[instance_name];
       }
     }
 
-    nlohmann::json wakeup_body;
-    wakeup_body["model_id"] = model_id;
-    wakeup_body["master_status"] = 0;
+    double space_needed = model_size - (kMaxInstanceMemoryGB - current_usage);
 
-    if (send_http_request(instance_name, "/wakeup", wakeup_body.dump())) {
-      LOG(INFO) << "Model " << model_id << " on " << instance_name
-                << " trigger wakeup success.";                
-      std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
-      instance_model_states_[instance_name][model_id] = 0;  // Wakeup
-    } else {
-      LOG(ERROR) << "Failed to wakeup model " << model_id << " on "
-                << instance_name;
+    auto candidates = select_eviction_candidates(instance_name, space_needed);
+    if (candidates.empty()) {
+      continue; // Cannot free enough space on this instance
     }
 
+    // Calculate total heat of candidates
+    uint64_t current_plan_heat = 0;
+    {
+      std::lock_guard<std::mutex> heat_lock(model_heat_mutex_);
+      for (const auto& mod : candidates) {
+        if (global_model_heat_.count(mod)) {
+          current_plan_heat += global_model_heat_[mod];
+        }
+      }
+    }
+
+    if (current_plan_heat < min_evicted_heat_sum) {
+      min_evicted_heat_sum = current_plan_heat;
+      best_candidate_instance = instance_name;
+      best_eviction_plan = candidates;
+    }
+  }
+  inst_lock.unlock();
+
+  if (!best_candidate_instance.empty()) {
+    // Execute eviction
+    for (const auto& mod_to_sleep : best_eviction_plan) {
+      send_model_sleep(best_candidate_instance, mod_to_sleep);
+    }
+    send_model_wakeup(best_candidate_instance, model_id);
+    return best_candidate_instance;
+  }
+
+  return ""; // Failed to allocate
+}
+
+// Select models to evict out >= required_space, meanwhile minimizing sum(heat)
+std::vector<std::string> InstanceMgr::select_eviction_candidates(const std::string& instance_name, 
+                                                                 double required_space) {
+    
+    // Get all awake models on this instance
+    std::vector<std::string> awake_models;
+    {
+      std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
+      if (instance_model_states_.count(instance_name)) {
+        for (const auto& pair : instance_model_states_.at(instance_name)) {
+          if (pair.second == ModelState::WAKEUP) { // Awake
+            awake_models.push_back(pair.first);
+          }
+        }
+      }
+    }
+
+    // Select models to evict enough space for the new model, meanwhile minimizing sum(heat)
+    std::vector<uint64_t> awake_model_heats;
+    {
+      std::lock_guard<std::mutex> lock(model_heat_mutex_);
+      for (const auto& model_id : awake_models) {
+        awake_model_heats.push_back(global_model_heat_[model_id]);
+      }
+    }
+
+    uint64_t min_sum_heat = std::numeric_limits<uint64_t>::max();
+    size_t best_subset = 0;
+    for (size_t subset = 0; subset < 1 << awake_models.size(); ++subset) {
+      double current_sum_space = 0;
+      uint64_t current_sum_heat = 0;
+      for (size_t i = 0; i < awake_models.size(); ++i) {
+        if (subset & (1 << i)) {
+          current_sum_space += get_model_memory_size(awake_models[i]);
+          current_sum_heat += awake_model_heats[i];
+        }
+      }
+      if (current_sum_space >= required_space && 
+          current_sum_heat < min_sum_heat) {
+        min_sum_heat = current_sum_heat;
+        best_subset = subset;
+      }
+    }
+
+    if (best_subset == 0) {
+      return {};// Cannot free enough space even if we evict everything
+    }
+
+    std::vector<std::string> candidates;
+    for (size_t i = 0; i < awake_models.size(); ++i) {
+      if (best_subset & (1 << i)) {
+        candidates.push_back(awake_models[i]);
+      }
+    }
+
+    return candidates;
   }
 
 }  // namespace xllm_service

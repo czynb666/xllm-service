@@ -84,7 +84,18 @@ class InstanceMgr final {
                         const std::string& model_id);
 
   void send_model_wakeup(const std::string& instance_name,
-                         const std::string& model_id);                        
+                         const std::string& model_id);
+
+  // New methods for memory-aware scheduling
+  std::string get_awake_instance(const std::string& model_id);
+  std::string allocate_instance_for_model(const std::string& model_id);
+  void update_model_heat(const std::string& model_id, int64_t token_count);
+
+ private:
+  void init_model_memory_specs();
+  double get_model_memory_size(const std::string& model_id);
+  // Select models to evict on a specific instance to free up required_space
+  std::vector<std::string> select_eviction_candidates(const std::string& instance_name, double required_space);
 
  private:
 
@@ -129,18 +140,39 @@ class InstanceMgr final {
 
   std::shared_ptr<EtcdClient> etcd_client_;
 
+  static constexpr double kMaxInstanceMemoryGB = 60.0;
+  // model_id -> memory_spec (GB)
+  std::unordered_map<std::string, double> model_memory_specs_;
+
+  enum class ModelState : int32_t {
+    WAKEUP = 0,
+    SLEEP = 1
+  };
+
+  // instances_, instance_model_states_ use shared_mutex
+  // because they only change when instance registration or model state changes
+  // global_model_heat_ and instance_memory_usage_ use mutex 
+  // because they change frequently when requests come
+  // pending_infos_ use mutex because there's no read-only operation
+  
   std::shared_mutex inst_mutex_;
-  std::unordered_map<std::string, InstanceMetaInfo> instances_;
+  std::unordered_map<std::string, InstanceMetaInfo> instances_;  
   std::vector<std::string> prefill_index_;
   std::vector<std::string> decode_index_;
   uint64_t next_prefill_index_ = 0;
   uint64_t next_decode_index_ = 0;
 
-  // Record the model state for each instance.
-  // instance_name -> model_id -> status (0: wakeup, 1: sleep)
-  std::mutex instance_model_state_mutex_;
-  std::unordered_map<std::string, std::unordered_map<std::string, int>>
+  std::shared_mutex instance_model_state_mutex_;
+  std::unordered_map<std::string, std::unordered_map<std::string, ModelState>>
       instance_model_states_;
+
+  // Global model heat (token count)
+  std::mutex model_heat_mutex_;
+  std::unordered_map<std::string, int64_t> global_model_heat_;
+
+  // instance_name -> current_memory_usage (GB)
+  std::mutex instance_memory_mutex_;
+  std::unordered_map<std::string, double> instance_memory_usage_;
 
   std::mutex pending_mutex_;
   std::unordered_map<std::string, InstanceMetaInfo> pending_infos_;
