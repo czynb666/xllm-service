@@ -66,7 +66,8 @@ bool Master::start_http_server() {
                               "/v1/chat/completions => ChatCompletions,"
                               "/v1/embeddings => Embeddings,"
                               "/v1/models => Models,"
-                              "/metrics => Metrics,") != 0) {
+                              "/metrics => Metrics,"
+                              "/model/triggers => ModelTriggers") != 0) {
     LOG(FATAL) << "Fail to add http service";
     return false;
   }

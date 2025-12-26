@@ -72,6 +72,32 @@ class InstanceMgr final {
 
   void set_as_master();
 
+  void fork_master_and_sleep(const std::string& instance_name,
+                             std::shared_ptr<brpc::Channel> channel);
+
+  void wakeup_model(const std::string& instance_name,
+                    const std::string& model_id);
+
+  void on_heartbeat(const std::string& instance_name);
+
+  void send_model_sleep(const std::string& instance_name,
+                        const std::string& model_id);
+
+  void send_model_wakeup(const std::string& instance_name,
+                         const std::string& model_id);                        
+
+ private:
+
+  // send_http_request(instance_name, ...) uses inst_mutex to get_channel()
+  // send_http_request(channel, ...) does not use inst_mutex
+  bool send_http_request(const std::string& instance_name,
+                         const std::string& uri,
+                         const std::string& request_body);
+
+  bool send_http_request(std::shared_ptr<brpc::Channel> channel,
+                         const std::string& uri,
+                         const std::string& request_body);
+
  private:
   DISALLOW_COPY_AND_ASSIGN(InstanceMgr);
 
@@ -91,6 +117,9 @@ class InstanceMgr final {
 
   void flip_decode_to_prefill(std::string& instance_name);
 
+  void register_instance(const std::string& instance_name,
+                         InstanceMetaInfo metainfo);
+
  private:
   Options options_;
 
@@ -106,6 +135,15 @@ class InstanceMgr final {
   std::vector<std::string> decode_index_;
   uint64_t next_prefill_index_ = 0;
   uint64_t next_decode_index_ = 0;
+
+  // Record the model state for each instance.
+  // instance_name -> model_id -> status (0: wakeup, 1: sleep)
+  std::mutex instance_model_state_mutex_;
+  std::unordered_map<std::string, std::unordered_map<std::string, int>>
+      instance_model_states_;
+
+  std::mutex pending_mutex_;
+  std::unordered_map<std::string, InstanceMetaInfo> pending_infos_;
 
   std::shared_mutex load_metric_mutex_;
   std::unordered_map<std::string, LoadMetrics> load_metrics_;

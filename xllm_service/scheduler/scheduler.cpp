@@ -94,6 +94,16 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
   auto ret = lb_policy_->select_instances_pair(request);
   DLOG(INFO) << request->routing.debug_string();
 
+  if (ret) {
+    if (!request->routing.prefill_name.empty()) {
+      instance_mgr_->wakeup_model(request->routing.prefill_name, request->model);
+    }
+    if (!request->routing.decode_name.empty() &&
+        request->routing.decode_name != request->routing.prefill_name) {
+      instance_mgr_->wakeup_model(request->routing.decode_name, request->model);
+    }
+  }
+
   // update request metrics
   if (request->prompt.size() != 0) {
     instance_mgr_->update_request_metrics(request, RequestAction::SCHEDULE);
@@ -121,6 +131,7 @@ void Scheduler::handle_instance_heartbeat(const proto::HeartbeatRequest* req) {
   if (exited_) {
     return;
   }
+  instance_mgr_->on_heartbeat(req->name());
   global_kvcache_mgr_->record_updated_kvcaches(req->name(), req->cache_event());
   instance_mgr_->record_load_metrics_update(req->name(), req->load_metrics());
   instance_mgr_->update_latency_metrics(req->name(), req->latency_metrics());

@@ -43,6 +43,8 @@ class Scheduler final {
 
   InstanceMetaInfo get_instance_info(const std::string& instance_name);
 
+  InstanceMgr* get_instance_mgr() { return instance_mgr_.get(); }
+
   std::vector<std::string> get_static_decode_list(
       const std::string& instance_name);
 

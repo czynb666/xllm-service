@@ -507,4 +507,46 @@ void XllmHttpServiceImpl::Metrics(::google::protobuf::RpcController* controller,
   get_serving("/metrics", controller, request, response, done);
 }
 
+void XllmHttpServiceImpl::ModelTriggers(
+    ::google::protobuf::RpcController* controller,
+    const proto::ModelTriggerRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  assert(initialized_);
+  ClosureGuard done_guard(done);
+  auto cntl = reinterpret_cast<brpc::Controller*>(controller);
+
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | respose | controller is null";
+    cntl->SetFailed("brpc request | respose | controller is null");
+    return;
+  }
+
+  std::string model_id = request->model_id();
+  std::string instance_name = request->instance_name();
+  std::string trigger_type = request->trigger_type();
+
+  if (trigger_type == "sleep") {
+    LOG(INFO) << "Sending model sleep request: " << trigger_type
+              << " for model " << model_id << " on instance "
+              << instance_name;
+    scheduler_->get_instance_mgr()->send_model_sleep(
+        instance_name, model_id);
+  } else if (trigger_type == "wakeup") {
+    LOG(INFO) << "Sending model wakeup request: " << trigger_type
+              << " for model " << model_id << " on instance "
+              << instance_name;
+    scheduler_->get_instance_mgr()->send_model_wakeup(
+        instance_name, model_id);
+  } else {
+    LOG(ERROR) << "Invalid trigger type: " << trigger_type;
+    cntl->SetFailed("Invalid trigger type: " + trigger_type);
+    return;
+  }
+
+
+
+  cntl->response_attachment().append("Model trigger sent.");
+}
+
 }  // namespace xllm_service

@@ -71,6 +71,11 @@ class XllmHttpServiceImpl : public proto::XllmHttpService {
                proto::HttpResponse* response,
                ::google::protobuf::Closure* done) override;
 
+  void ModelTriggers(::google::protobuf::RpcController* controller,
+                     const proto::ModelTriggerRequest* request,
+                     proto::HttpResponse* response,
+                     ::google::protobuf::Closure* done) override;
+
  private:
   template <typename T>
   std::shared_ptr<Request> generate_request(T* req_pb,

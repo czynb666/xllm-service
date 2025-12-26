@@ -16,6 +16,7 @@ limitations under the License.
 #include "instance_mgr.h"
 
 #include <absl/strings/str_join.h>
+#include <brpc/controller.h>
 #include <glog/logging.h>
 
 #include <chrono>
@@ -210,6 +211,99 @@ std::vector<std::string> InstanceMgr::get_static_prefill_list(
   return prefill_list;
 }
 
+static const std::vector<std::pair<std::string, std::string>> MODELS = {
+    {"Qwen3-8B", "/export/home/models/Qwen3-8B"},
+    {"Qwen2-7B", "/export/home/models/Qwen2-7B"}};
+
+static uint16_t master_node_port = 40000;// multithread unsafe yet
+
+void InstanceMgr::fork_master_and_sleep(
+    const std::string& instance_name,
+    std::shared_ptr<brpc::Channel> channel) {
+  for (const auto& model : MODELS) {
+    // 1. Fork Master
+    nlohmann::json fork_body;
+    fork_body["model_path"] = model.second;
+    fork_body["master_node_addr"] = "127.0.0.1:" + std::to_string(++master_node_port);
+    fork_body["master_status"] = 0;
+
+    if (!send_http_request(channel, "/fork_master", fork_body.dump())) {
+      LOG(ERROR) << "Failed to fork master for model " << model.first << " on "
+                 << instance_name;
+      continue;
+    }
+
+    // 2. Sleep
+    nlohmann::json sleep_body;
+    sleep_body["model_id"] = model.first;
+    sleep_body["master_status"] = 1;
+
+    if (send_http_request(channel, "/sleep", sleep_body.dump())) {
+      std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
+      instance_model_states_[instance_name][model.first] = 1;  // Sleep
+      LOG(INFO) << "Model " << model.first << " on " << instance_name
+                << " is now SLEEPING";
+    } else {
+      LOG(ERROR) << "Failed to sleep model " << model.first << " on "
+                 << instance_name;
+    }
+  }
+}
+
+void InstanceMgr::wakeup_model(const std::string& instance_name,
+                               const std::string& model_id) {
+  {
+    std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
+    if (instance_model_states_[instance_name].count(model_id) &&
+        instance_model_states_[instance_name][model_id] == 0) {
+      return;  // Already wakeup
+    }
+  }
+
+  nlohmann::json wakeup_body;
+  wakeup_body["model_id"] = model_id;
+  wakeup_body["master_status"] = 0;
+
+  if (send_http_request(instance_name, "/wakeup", wakeup_body.dump())) {
+    std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
+    instance_model_states_[instance_name][model_id] = 0;  // Wakeup
+    LOG(INFO) << "Model " << model_id << " on " << instance_name
+              << " is now WAKEUP";
+  } else {
+    LOG(ERROR) << "Failed to wakeup model " << model_id << " on "
+               << instance_name;
+  }
+}
+
+bool InstanceMgr::send_http_request(const std::string& instance_name,
+                                    const std::string& uri,
+                                    const std::string& request_body) {
+  std::shared_ptr<brpc::Channel> channel = get_channel(instance_name);
+  if (!channel) {
+    LOG(ERROR) << "Channel not found for " << instance_name;
+    return false;
+  }
+  return send_http_request(channel, uri, request_body);
+}
+
+bool InstanceMgr::send_http_request(std::shared_ptr<brpc::Channel> channel,
+                                    const std::string& uri,
+                                    const std::string& request_body) {
+  brpc::Controller cntl;
+  cntl.http_request().uri() = uri;  // brpc channel already has host:port
+  cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
+  cntl.http_request().set_content_type("application/json");
+  cntl.request_attachment().append(request_body);
+
+  channel->CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+
+  if (cntl.Failed()) {
+    LOG(ERROR) << "HTTP request failed: " << cntl.ErrorText();
+    return false;
+  }
+  return true;
+}
+
 void InstanceMgr::get_load_metrics(LoadBalanceInfos* infos) {
   std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
   std::shared_lock<std::shared_mutex> metric_lock(load_metric_mutex_);
@@ -317,6 +411,102 @@ void InstanceMgr::set_as_master() {
   etcd_client_->remove_watch(ETCD_LOADMETRICS_PREFIX);
 }
 
+void InstanceMgr::on_heartbeat(const std::string& instance_name) {
+  InstanceMetaInfo metainfo;
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    auto it = pending_infos_.find(instance_name);
+    if (it == pending_infos_.end()) {
+      return;
+    }
+    metainfo = std::move(it->second);
+    pending_infos_.erase(it);
+  }
+
+  LOG(INFO) << "Received heartbeat from pending instance: " << instance_name;
+  threadpool_.schedule([this, instance_name, metainfo = std::move(metainfo)]() {
+    register_instance(instance_name, metainfo);
+  });
+}
+
+void InstanceMgr::register_instance(const std::string& instance_name,
+                                    InstanceMetaInfo metainfo) {
+  std::unique_lock<std::shared_mutex> lock(inst_mutex_);
+  if (instances_.find(instance_name) != instances_.end()) {
+    LOG(ERROR) << "Instance is already registered, instance_name: "
+               << instance_name;
+    return;
+  }
+
+  if (!create_channel(instance_name)) {
+    LOG(ERROR) << "create channel fail: " << instance_name;
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
+    instance_model_states_.emplace(instance_name,
+                                   std::unordered_map<std::string, int>());
+  }
+  
+  // Note: we can't call fork_master_and_sleep here if we are holding
+  // inst_mutex_ and fork_master_and_sleep calls send_http_request which calls
+  // get_channel which acquires inst_mutex_ again (deadlock).
+  auto channel = cached_channels_[instance_name];
+  fork_master_and_sleep(instance_name, channel);
+
+  {
+    std::lock_guard<std::mutex> time_predictor_lock(time_predictor_mutex_);
+    std::lock_guard<std::mutex> request_metrics_lock(request_metrics_mutex_);
+    // create ttft predictor for instance
+    time_predictors_.emplace(instance_name,
+                             TimePredictor(metainfo.ttft_profiling_data,
+                                           metainfo.tpot_profiling_data));
+
+    // create request metrics for instance
+    request_metrics_.emplace(instance_name, RequestMetrics());
+  }
+
+  switch (metainfo.type) {
+    case InstanceType::DEFAULT:
+    case InstanceType::PREFILL:
+      metainfo.instance_index = prefill_index_.size();
+      prefill_index_.emplace_back(instance_name);
+      LOG(INFO) << "Register a new prefill instance, instance name : "
+                << instance_name;
+      break;
+    case InstanceType::DECODE:
+      metainfo.instance_index = decode_index_.size();
+      decode_index_.emplace_back(instance_name);
+      LOG(INFO) << "Register a new decode instance, instance name : "
+                << instance_name;
+      break;
+    case InstanceType::MIX:
+      // In the initial state, we set the first MIX type instance as a
+      // decode instance, while all subsequent instances are set as
+      // prefill instances.
+      if (decode_index_.size() > 0) {
+        metainfo.instance_index = prefill_index_.size();
+        metainfo.current_type = InstanceType::PREFILL;
+        prefill_index_.emplace_back(instance_name);
+        LOG(INFO) << "Register a new prefill instance, instance name : "
+                  << instance_name;
+      } else {
+        metainfo.instance_index = decode_index_.size();
+        metainfo.current_type = InstanceType::DECODE;
+        decode_index_.emplace_back(instance_name);
+        LOG(INFO) << "Register a new decode instance, instance name : "
+                  << instance_name;
+      }
+      break;
+    default:
+      LOG(WARNING) << "Unknown InstanceType: " << int(metainfo.type);
+      break;
+  }
+
+  instances_.insert(std::make_pair(instance_name, std::move(metainfo)));
+}
+
 std::shared_ptr<brpc::Channel> InstanceMgr::get_channel(
     const std::string& instance_name) {
   std::shared_lock<std::shared_mutex> lock(inst_mutex_);
@@ -387,68 +577,29 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
           continue;
         }
 
-        if (!create_channel(iter.first)) {
-          LOG(ERROR) << "create channel fail: " << iter.first;
-          continue;
-        }
-
         {
-          std::lock_guard<std::mutex> time_predictor_lock(
-              time_predictor_mutex_);
-          std::lock_guard<std::mutex> request_metrics_lock(
-              request_metrics_mutex_);
-          // create ttft predictor for instance
-          time_predictors_.emplace(
-              iter.first,
-              TimePredictor(iter.second.ttft_profiling_data,
-                            iter.second.tpot_profiling_data));
-
-          // create request metrics for instance
-          request_metrics_.emplace(iter.first, RequestMetrics());
+          std::lock_guard<std::mutex> lock(pending_mutex_);
+          if (pending_infos_.count(iter.first)) {
+            LOG(INFO) << "Instance is pending, instance_name: " << iter.first;
+            continue;
+          }
+          pending_infos_.insert(
+              std::make_pair(iter.first, std::move(iter.second)));
+          LOG(INFO) << "Add instance to pending list and wait for heartbeat: "
+                    << iter.first;
         }
-
-        switch (iter.second.type) {
-          case InstanceType::DEFAULT:
-          case InstanceType::PREFILL:
-            iter.second.instance_index = prefill_index_.size();
-            prefill_index_.emplace_back(iter.first);
-            LOG(INFO) << "Register a new prefill instance, instance name : "
-                      << iter.first;
-            break;
-          case InstanceType::DECODE:
-            iter.second.instance_index = decode_index_.size();
-            decode_index_.emplace_back(iter.first);
-            LOG(INFO) << "Register a new decode instance, instance name : "
-                      << iter.first;
-            break;
-          case InstanceType::MIX:
-            // In the initial state, we set the first MIX type instance as a
-            // decode instance, while all subsequent instances are set as
-            // prefill instances.
-            if (decode_index_.size() > 0) {
-              iter.second.instance_index = prefill_index_.size();
-              iter.second.current_type = InstanceType::PREFILL;
-              prefill_index_.emplace_back(iter.first);
-              LOG(INFO) << "Register a new prefill instance, instance name : "
-                        << iter.first;
-            } else {
-              iter.second.instance_index = decode_index_.size();
-              iter.second.current_type = InstanceType::DECODE;
-              decode_index_.emplace_back(iter.first);
-              LOG(INFO) << "Register a new decode instance, instance name : "
-                        << iter.first;
-            }
-            break;
-          default:
-            LOG(WARNING) << "Unknown InstanceType: " << int(iter.second.type);
-            break;
-        }
-
-        instances_.insert(std::make_pair(iter.first, std::move(iter.second)));
       }
 
       for (auto& iter : delete_list) {
         LOG(INFO) << "delete instance: " << iter;
+        {
+          std::lock_guard<std::mutex> lock(pending_mutex_);
+          if (pending_infos_.count(iter)) {
+            pending_infos_.erase(iter);
+            LOG(INFO) << "Delete pending instance: " << iter;
+            continue;
+          }
+        }
         if (instances_.find(iter) == instances_.end()) {
           LOG(ERROR) << "Instance is already deleted, instance_name: " << iter;
           continue;
@@ -509,6 +660,10 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
               request_metrics_mutex_);
           time_predictors_.erase(iter);
           request_metrics_.erase(iter);
+        }
+        {
+          std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
+          instance_model_states_.erase(iter);
         }
         {
           std::lock_guard<std::mutex> lock(update_mutex_);
@@ -812,5 +967,73 @@ TimePredictor& InstanceMgr::get_time_predictor(
   }
   return it->second;
 }
+
+void InstanceMgr::send_model_sleep(const std::string& instance_name,
+                                   const std::string& model_id) {
+
+    if (instance_name.empty() || instance_name == "all") {
+      LOG(ERROR) << "Only support fixed instance_name for model trigger now.";
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
+      if (instance_model_states_[instance_name].count(model_id) &&
+          instance_model_states_[instance_name][model_id] == 1) {
+        LOG(INFO) << "Model " << model_id << " on " << instance_name
+                  << " is already sleeping.";
+        return;  // Already sleep
+      }
+    }
+
+    nlohmann::json sleep_body;
+    sleep_body["model_id"] = model_id;
+    sleep_body["master_status"] = 1;
+
+    if (send_http_request(instance_name, "/sleep", sleep_body.dump())) {
+      LOG(INFO) << "Model " << model_id << " on " << instance_name
+                << " trigger sleep success.";
+      std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
+      instance_model_states_[instance_name][model_id] = 1;  // Sleep
+    } else {
+      LOG(ERROR) << "Failed to sleep model " << model_id << " on "
+                << instance_name;
+    }
+
+  }
+
+void InstanceMgr::send_model_wakeup(const std::string& instance_name,
+                                     const std::string& model_id) {
+
+    if (instance_name.empty() || instance_name == "all") {
+      LOG(ERROR) << "Only support fixed instance_name for model trigger now.";
+      return;
+    }
+    
+    {
+      std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
+      if (instance_model_states_[instance_name].count(model_id) &&
+          instance_model_states_[instance_name][model_id] == 0) {
+        LOG(INFO) << "Model " << model_id << " on " << instance_name
+                  << " is already wakeup.";
+        return;  // Already wakeup
+      }
+    }
+
+    nlohmann::json wakeup_body;
+    wakeup_body["model_id"] = model_id;
+    wakeup_body["master_status"] = 0;
+
+    if (send_http_request(instance_name, "/wakeup", wakeup_body.dump())) {
+      LOG(INFO) << "Model " << model_id << " on " << instance_name
+                << " trigger wakeup success.";                
+      std::lock_guard<std::mutex> lock(instance_model_state_mutex_);
+      instance_model_states_[instance_name][model_id] = 0;  // Wakeup
+    } else {
+      LOG(ERROR) << "Failed to wakeup model " << model_id << " on "
+                << instance_name;
+    }
+
+  }
 
 }  // namespace xllm_service
