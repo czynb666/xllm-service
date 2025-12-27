@@ -217,7 +217,7 @@ std::vector<std::string> InstanceMgr::get_static_prefill_list(
 static const std::vector<std::pair<std::string, std::string>> MODELS = {
     {"Qwen3-8B", "/export/home/models/Qwen3-8B"},
     {"Qwen2-7B", "/export/home/models/Qwen2-7B"},
-    {"Qwen2.5-14B", "/export/home/models/Qwen2.5-14B"},
+    // {"Qwen2.5-14B", "/export/home/models/Qwen2.5-14B"}
     {"Qwen3-4B", "/export/home/models/Qwen3-4B"}
     // {"Qwen2.5-3b", "/export/home/models/Qwen2.5-3b"}
     // {"Qwen3-30B-A3B-W8A8", "/export/home/models/Qwen3-30B-A3B-W8A8"},
@@ -585,8 +585,29 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
       std::unique_lock<std::shared_mutex> lock(inst_mutex_);
       for (auto& iter : put_map) {
         if (instances_.find(iter.first) != instances_.end()) {
-          LOG(ERROR) << "Instance is already registered, instance_name: "
-                     << iter.first;
+          // Update existing instance profiling data
+          LOG(INFO) << "Update instance profiling data, instance_name: " << iter.first;
+          auto& exist_info = instances_[iter.first];
+          auto& new_info = iter.second;
+          
+          // Merge TTFT profiling data
+          for (auto& [model_id, data] : new_info.ttft_profiling_data) {
+            exist_info.ttft_profiling_data[model_id] = std::move(data);
+          }
+          
+          // Merge TPOT profiling data
+          for (auto& [model_id, data] : new_info.tpot_profiling_data) {
+            exist_info.tpot_profiling_data[model_id] = std::move(data);
+          }
+
+          // Update TimePredictor
+          {
+            std::lock_guard<std::mutex> time_predictor_lock(time_predictor_mutex_);
+            time_predictors_.insert_or_assign(
+                iter.first,
+                TimePredictor(exist_info.ttft_profiling_data,
+                              exist_info.tpot_profiling_data));
+          }
           continue;
         }
 
@@ -736,10 +757,19 @@ void InstanceMgr::update_latency_metrics(
     const proto::LatencyMetrics& latency_metrics) {
   std::lock_guard<std::mutex> lock(latency_metrics_mutex_);
 
-  latency_metrics_.insert_or_assign(
-      instance_name,
-      LatencyMetrics(latency_metrics.recent_max_ttft(),
-                     latency_metrics.recent_max_tbt()));
+  LatencyMetrics metrics;
+  for (const auto& entry : latency_metrics.model_metrics()) {
+    const std::string& model_id = entry.first;
+    const auto& proto_model_metrics = entry.second;
+    
+    LatencyMetrics::ModelLatencyMetrics model_metrics;
+    model_metrics.recent_max_ttft = proto_model_metrics.recent_max_ttft();
+    model_metrics.recent_max_tbt = proto_model_metrics.recent_max_tbt();
+    
+    metrics.model_metrics[model_id] = model_metrics;
+  }
+  
+  latency_metrics_.insert_or_assign(instance_name, std::move(metrics));
 }
 
 void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
@@ -856,7 +886,7 @@ bool InstanceMgr::select_instance_pair_on_slo(
     auto& time_predictor = get_time_predictor(decode_instance);
     // calculate the estimated tpot
     int64_t estimated_tpot = time_predictor.predict_tpot(
-        token_num + request->token_ids.size(), request_num + 1);
+        request->model, token_num + request->token_ids.size(), request_num + 1);
     // If the estimated tpot meets the requirements, the request will be
     // directly dispatched to that instance.
     if (estimated_tpot <= FLAGS_target_tpot && target_decode_instance.empty()) {
@@ -891,7 +921,7 @@ bool InstanceMgr::select_instance_pair_on_slo(
     // update estimated ttft
     auto& time_predictor = get_time_predictor(min_decode_instance);
     request->estimated_ttft =
-        time_predictor.predict_ttft(request->token_ids.size());
+        time_predictor.predict_ttft(request->model, request->token_ids.size());
     request_metrics_[min_decode_instance].estimated_prefill_time +=
         request->estimated_ttft;
   } else {
@@ -899,7 +929,7 @@ bool InstanceMgr::select_instance_pair_on_slo(
     // update estimated ttft
     auto& time_predictor = get_time_predictor(min_prefill_instance);
     request->estimated_ttft =
-        time_predictor.predict_ttft(request->token_ids.size());
+        time_predictor.predict_ttft(request->model, request->token_ids.size());
     request_metrics_[min_prefill_instance].estimated_prefill_time +=
         request->estimated_ttft;
   }
@@ -1068,6 +1098,7 @@ void InstanceMgr::init_model_memory_specs() {
     // Hardcoded memory specs: x * 2 + 5 GB. 5GB = 3GB KV cache + 2GB overhead
     model_memory_specs_["Qwen3-8B"] = 8.0 * 2 + 5.0;
     model_memory_specs_["Qwen2-7B"] = 7.0 * 2 + 5.0;
+    model_memory_specs_["Qwen2-7B-Instruct"] = 7.0 * 2 + 5.0;
     model_memory_specs_["Qwen2.5-14B"] = 14.0 * 2 + 5.0;
     model_memory_specs_["Qwen3-4B"] = 4.0 * 2 + 5.0;
     model_memory_specs_["Qwen2.5-3b"] = 3.0 * 2 + 5.0;
@@ -1090,7 +1121,7 @@ std::string InstanceMgr::get_awake_instance(const std::string& model_id) {
     const std::string& instance_name = instance_pair.first;
     const auto& model_states = instance_pair.second;
     
-    if (model_states.count(model_id) && model_states.at(model_id) == ModelState::WAKEUP) { // 0 means awake
+    if (model_states.count(model_id) && model_states.at(model_id) == ModelState::WAKEUP) {
       return instance_name;
     }
   }

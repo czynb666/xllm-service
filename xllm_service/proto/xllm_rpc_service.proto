@@ -52,9 +52,13 @@ message LoadMetrics {
   float gpu_cache_usage_perc = 2;
 }
 
-message LatencyMetrics {
+message ModelLatencyMetrics {
   int64 recent_max_ttft = 1;
   int64 recent_max_tbt = 2;
+}
+
+message LatencyMetrics {
+  map<string, ModelLatencyMetrics> model_metrics = 1;
 }
 
 message HeartbeatRequest {

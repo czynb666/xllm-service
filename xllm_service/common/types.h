@@ -116,14 +116,15 @@ struct LoadMetrics {
 
 // Record the latency monitoring metrics of the instance over the recent period
 struct LatencyMetrics {
-  LatencyMetrics() : recent_max_ttft(0), recent_max_tbt(0) {}
+  struct ModelLatencyMetrics {
+    int64_t recent_max_ttft = 0;
+    int64_t recent_max_tbt = 0;
+  };
 
-  LatencyMetrics(const int64_t& recent_max_ttft, const int64_t& recent_max_tbt)
-      : recent_max_ttft(recent_max_ttft), recent_max_tbt(recent_max_tbt) {}
+  LatencyMetrics() = default;
 
-  // The unit is milliseconds.
-  int64_t recent_max_ttft;
-  int64_t recent_max_tbt;
+  // model_id -> metrics
+  std::unordered_map<std::string, ModelLatencyMetrics> model_metrics;
 };
 
 enum class RequestAction : int32_t {
@@ -176,12 +177,13 @@ struct InstanceMetaInfo {
   std::vector<uint64_t> k_cache_ids;
   std::vector<uint64_t> v_cache_ids;
   int32_t dp_size;
-  // ttft profiling data
-  std::vector<std::pair<int32_t, double>> ttft_profiling_data;
-  // tpot profiling data
-  std::vector<std::tuple<int32_t, int32_t, double>> tpot_profiling_data;
 
-  // latest heatbeat timestamp
+  // ttft profiling data per model: model_id -> profiling_data
+  std::unordered_map<std::string, std::vector<std::pair<int32_t, double>>> ttft_profiling_data;
+  // tpot profiling data per model: model_id -> profiling_data
+  std::unordered_map<std::string, std::vector<std::tuple<int32_t, int32_t, double>>> tpot_profiling_data;
+
+  // latest heartbeat timestamp
   uint64_t latest_timestamp = 0;
 
   uint64_t instance_index = -1;
@@ -200,8 +202,21 @@ struct InstanceMetaInfo {
     json_val["k_cache_ids"] = k_cache_ids;
     json_val["v_cache_ids"] = v_cache_ids;
     json_val["dp_size"] = dp_size;
-    json_val["ttft_profiling_data"] = ttft_profiling_data;
-    json_val["tpot_profiling_data"] = tpot_profiling_data;
+    
+    // Serialize ttft_profiling_data as object with model_id keys
+    nlohmann::json ttft_json;
+    for (const auto& [model_id, data] : ttft_profiling_data) {
+      ttft_json[model_id] = data;
+    }
+    json_val["ttft_profiling_data"] = ttft_json;
+    
+    // Serialize tpot_profiling_data as object with model_id keys
+    nlohmann::json tpot_json;
+    for (const auto& [model_id, data] : tpot_profiling_data) {
+      tpot_json[model_id] = data;
+    }
+    json_val["tpot_profiling_data"] = tpot_json;
+
     return json_val;
   }
 
@@ -236,15 +251,39 @@ struct InstanceMetaInfo {
 
       dp_size = json_value.at("dp_size").get<int32_t>();
 
-      for (const auto& item : json_value.at("ttft_profiling_data")) {
-        if (item.is_array() && item.size() == 2) {
-          ttft_profiling_data.emplace_back(item[0], item[1]);
+      // Parse ttft_profiling_data as object with model_id keys
+      if (json_value.contains("ttft_profiling_data")) {
+        const auto& ttft_json = json_value.at("ttft_profiling_data");
+        for (auto it = ttft_json.begin(); it != ttft_json.end(); ++it) {
+          const std::string& model_id = it.key();
+          const auto& data_array = it.value();
+          std::vector<std::pair<int32_t, double>> model_data;
+          for (const auto& item : data_array) {
+            if (item.is_array() && item.size() == 2) {
+              model_data.emplace_back(item[0].get<int32_t>(), item[1].get<double>());
+            }
+          }
+          ttft_profiling_data[model_id] = std::move(model_data);
         }
       }
 
-      for (const auto& item : json_value.at("tpot_profiling_data")) {
-        if (item.is_array() && item.size() == 3) {
-          tpot_profiling_data.emplace_back(item[0], item[1], item[2]);
+      // Parse tpot_profiling_data as object with model_id keys
+      if (json_value.contains("tpot_profiling_data")) {
+        const auto& tpot_json = json_value.at("tpot_profiling_data");
+        for (auto it = tpot_json.begin(); it != tpot_json.end(); ++it) {
+          const std::string& model_id = it.key();
+          const auto& data_array = it.value();
+          std::vector<std::tuple<int32_t, int32_t, double>> model_data;
+          for (const auto& item : data_array) {
+            if (item.is_array() && item.size() == 3) {
+              model_data.emplace_back(
+                item[0].get<int32_t>(),
+                item[1].get<int32_t>(),
+                item[2].get<double>()
+              );
+            }
+          }
+          tpot_profiling_data[model_id] = std::move(model_data);
         }
       }
 

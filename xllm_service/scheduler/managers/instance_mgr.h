@@ -156,7 +156,7 @@ class InstanceMgr final {
   // pending_infos_ use mutex because there's no read-only operation
   
   std::shared_mutex inst_mutex_;
-  std::unordered_map<std::string, InstanceMetaInfo> instances_;  
+  std::unordered_map<std::string, InstanceMetaInfo> instances_;
   std::vector<std::string> prefill_index_;
   std::vector<std::string> decode_index_;
   uint64_t next_prefill_index_ = 0;
