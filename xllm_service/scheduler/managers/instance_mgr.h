@@ -43,7 +43,7 @@ class InstanceMgr final {
 
   InstanceMetaInfo get_instance_info(const std::string& instance_name);
 
-  bool get_next_instance_pair(Routing* routing);
+  bool get_next_instance_pair(const std::string& model_id, Routing* routing);
 
   std::vector<std::string> get_static_decode_list(
       const std::string& instance_name);
@@ -75,9 +75,6 @@ class InstanceMgr final {
   void fork_master_and_sleep(const std::string& instance_name,
                              std::shared_ptr<brpc::Channel> channel);
 
-  void wakeup_model(const std::string& instance_name,
-                    const std::string& model_id);
-
   void on_heartbeat(const std::string& instance_name);
 
   void send_model_sleep(const std::string& instance_name,
@@ -85,9 +82,10 @@ class InstanceMgr final {
 
   void send_model_wakeup(const std::string& instance_name,
                          const std::string& model_id);
+  
+  int32_t get_model_count(const std::string& model_id);
 
-  // New methods for memory-aware scheduling
-  std::string get_awake_instance(const std::string& model_id);
+  std::vector<std::string> get_awake_instances(const std::string& model_id);
   std::string allocate_instance_for_model(const std::string& model_id);
   void update_model_heat(const std::string& model_id, int64_t token_count);
 
@@ -149,18 +147,19 @@ class InstanceMgr final {
     SLEEP = 1
   };
 
-  // instances_, instance_model_states_ use shared_mutex
+  // instances_, instance_model_states_, model_count_ use shared_mutex
   // because they only change when instance registration or model state changes
   // global_model_heat_ and instance_memory_usage_ use mutex 
   // because they change frequently when requests come
-  // pending_infos_ use mutex because there's no read-only operation
+  // pending_infos_ use mutex because there's no read-only operations
   
   std::shared_mutex inst_mutex_;
   std::unordered_map<std::string, InstanceMetaInfo> instances_;
   std::vector<std::string> prefill_index_;
   std::vector<std::string> decode_index_;
-  uint64_t next_prefill_index_ = 0;
-  uint64_t next_decode_index_ = 0;
+
+  std::unordered_map<std::string, uint32_t> next_prefill_index_;
+  std::unordered_map<std::string, uint32_t> next_decode_index_;
 
   std::shared_mutex instance_model_state_mutex_;
   std::unordered_map<std::string, std::unordered_map<std::string, ModelState>>
@@ -169,6 +168,9 @@ class InstanceMgr final {
   // Global model heat (token count)
   std::mutex model_heat_mutex_;
   std::unordered_map<std::string, int64_t> global_model_heat_;
+
+  std::shared_mutex model_count_mutex_;
+  std::unordered_map<std::string, int32_t> model_count_;
 
   // instance_name -> current_memory_usage (GB)
   std::mutex instance_memory_mutex_;

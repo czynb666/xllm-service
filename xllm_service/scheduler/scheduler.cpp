@@ -97,15 +97,11 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
   }
 
   // Check if model is already awake on any instance
-  std::string awake_instance = instance_mgr_->get_awake_instance(request->model);
+  int32_t model_count = instance_mgr_->get_model_count(request->model);
   
   // TODO: support lb_policy based routing among multiple awake instances
-  if (!awake_instance.empty()) {
-      // Model is awake, route to it
-      request->routing.prefill_name = awake_instance;
-      request->routing.decode_name = awake_instance;
-      // You might want to refine this to use load balancing if multiple are awake,
-      // but for now, we pick the first one found.
+  if (model_count > 0) {
+    lb_policy_->select_instances_pair(request);
   } else {
       // Model is sleeping everywhere, need to allocate space and wake up
       std::string allocated_instance = instance_mgr_->allocate_instance_for_model(request->model);

@@ -167,21 +167,37 @@ InstanceMetaInfo InstanceMgr::get_instance_info(
   return instances_[instance_name];
 }
 
-bool InstanceMgr::get_next_instance_pair(Routing* routing) {
+bool InstanceMgr::get_next_instance_pair(const std::string& model_id, Routing* routing) {
   std::unique_lock<std::shared_mutex> lock(inst_mutex_);
   if (prefill_index_.empty()) {
-    LOG(ERROR) << "No prefill or default instance found!";
+    LOG(ERROR) << "No prefill or default instance found for model " << model_id;
     return false;
   }
-  next_prefill_index_ = next_prefill_index_ % prefill_index_.size();
-  routing->prefill_name = prefill_index_[next_prefill_index_];
-  next_prefill_index_++;
+
+  {
+    std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
+    int32_t now_prefill_index = next_prefill_index_[model_id];
+    while (instance_model_states_[prefill_index_[now_prefill_index]][model_id] != ModelState::WAKEUP) {
+      now_prefill_index = (now_prefill_index + 1) % prefill_index_.size();
+    }
+    routing->prefill_name = prefill_index_[now_prefill_index];
+    next_prefill_index_[model_id] = (now_prefill_index + 1) % prefill_index_.size();
+  }
+
   if (decode_index_.empty()) {
     return true;
   }
-  next_decode_index_ = next_decode_index_ % decode_index_.size();
-  routing->decode_name = decode_index_[next_decode_index_];
-  next_decode_index_++;
+
+  {
+    std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
+    int32_t now_decode_index = next_decode_index_[model_id];
+    while (instance_model_states_[decode_index_[now_decode_index]][model_id] != ModelState::WAKEUP) {
+      now_decode_index = (now_decode_index + 1) % decode_index_.size();
+    }
+    routing->decode_name = decode_index_[now_decode_index];
+    next_decode_index_[model_id] = (now_decode_index + 1) % decode_index_.size();
+  }
+
   return true;
 }
 
@@ -224,7 +240,7 @@ static const std::vector<std::pair<std::string, std::string>> MODELS = {
     // {"Qwen3-32B-W8A8", "/export/home/models/Qwen3-32B-W8A8"}
 };
 
-static uint16_t master_node_port = 40000;// multithread unsafe yet
+static std::atomic<uint16_t> master_node_port = 40000;
 
 void InstanceMgr::fork_master_and_sleep(
     const std::string& instance_name,
@@ -256,31 +272,6 @@ void InstanceMgr::fork_master_and_sleep(
       LOG(ERROR) << "Failed to sleep model " << model.first << " on "
                  << instance_name;
     }
-  }
-}
-
-void InstanceMgr::wakeup_model(const std::string& instance_name,
-                               const std::string& model_id) {
-  {
-    std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-    if (instance_model_states_[instance_name].count(model_id) &&
-        instance_model_states_[instance_name][model_id] == ModelState::WAKEUP) {
-      return;  // Already wakeup
-    }
-  }
-
-  nlohmann::json wakeup_body;
-  wakeup_body["model_id"] = model_id;
-  wakeup_body["master_status"] = 0;
-
-  if (send_http_request(instance_name, "/wakeup", wakeup_body.dump())) {
-    std::unique_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-    instance_model_states_[instance_name][model_id] = ModelState::WAKEUP;  // Wakeup
-    LOG(INFO) << "Model " << model_id << " on " << instance_name
-              << " is now WAKEUP";
-  } else {
-    LOG(ERROR) << "Failed to wakeup model " << model_id << " on "
-               << instance_name;
   }
 }
 
@@ -851,100 +842,24 @@ bool InstanceMgr::select_instance_pair_on_slo(
   std::unique_lock<std::shared_mutex> lock(inst_mutex_);
   std::lock_guard<std::mutex> request_metrics_lock(request_metrics_mutex_);
 
-  if (prefill_index_.empty()) {
-    LOG(ERROR) << "No prefill or default instance found!";
+  auto awake_instances = get_awake_instances(request->model);
+  if (awake_instances.empty()) {
+    LOG(ERROR) << "No awake instance found for model " << request->model;
     return false;
   }
 
   // get min prefill time instance from request metrics
-  auto min_prefill_instance = prefill_index_[0];
+  auto best_instance = awake_instances[0];
   int64_t min_prefill_time = std::numeric_limits<int64_t>::max();
-  int64_t total_prefill_time = 0;
-  for (auto& prefill_instance : prefill_index_) {
-    int64_t prefill_time =
-        request_metrics_[prefill_instance].estimated_prefill_time;
-    total_prefill_time += prefill_time;
+  for (auto& instance : awake_instances) {
+    int64_t prefill_time = request_metrics_[instance].estimated_prefill_time;
     if (prefill_time < min_prefill_time) {
-      min_prefill_instance = prefill_instance;
+      best_instance = instance;
       min_prefill_time = prefill_time;
     }
   }
-  int64_t avg_prefill_time = total_prefill_time / prefill_index_.size();
-
-  if (decode_index_.empty()) {
-    LOG(ERROR) << "No decode instance found!";
-    return false;
-  }
-
-  // select decode instance
-  auto min_decode_instance = decode_index_[0];
-  int64_t min_estimated_tpot = std::numeric_limits<int64_t>::max();
-  std::string target_decode_instance;
-  for (auto& decode_instance : decode_index_) {
-    int64_t token_num = request_metrics_[decode_instance].decode_token_num;
-    int64_t request_num = request_metrics_[decode_instance].decode_request_num;
-    auto& time_predictor = get_time_predictor(decode_instance);
-    // calculate the estimated tpot
-    int64_t estimated_tpot = time_predictor.predict_tpot(
-        request->model, token_num + request->token_ids.size(), request_num + 1);
-    // If the estimated tpot meets the requirements, the request will be
-    // directly dispatched to that instance.
-    if (estimated_tpot <= FLAGS_target_tpot && target_decode_instance.empty()) {
-      target_decode_instance = decode_instance;
-    }
-
-    // Record the instance with the minimum estimated tpot.
-    if (estimated_tpot < min_estimated_tpot) {
-      min_decode_instance = decode_instance;
-      min_estimated_tpot = estimated_tpot;
-    }
-  }
-
-  if (!target_decode_instance.empty()) {
-    request->routing.decode_name = target_decode_instance;
-  } else {
-    request->routing.decode_name = min_decode_instance;
-  }
-
-  // select prefill instance
-  float tpot_threshold = (decode_index_.size() - 1.0f) / decode_index_.size();
-  // When the prefill instances are already overloaded and there are other
-  // instances with lower loads in the decode group, we will dispatch the
-  // prefill requests to those instances to alleviate the pressure on the
-  // prefill instances.
-  if (min_prefill_time > FLAGS_target_ttft &&
-      target_decode_instance != min_decode_instance &&
-      min_estimated_tpot < FLAGS_target_tpot * tpot_threshold &&
-      request_metrics_[min_decode_instance].estimated_prefill_time <
-          min_prefill_time) {
-    request->routing.prefill_name = min_decode_instance;
-    // update estimated ttft
-    auto& time_predictor = get_time_predictor(min_decode_instance);
-    request->estimated_ttft =
-        time_predictor.predict_ttft(request->model, request->token_ids.size());
-    request_metrics_[min_decode_instance].estimated_prefill_time +=
-        request->estimated_ttft;
-  } else {
-    request->routing.prefill_name = min_prefill_instance;
-    // update estimated ttft
-    auto& time_predictor = get_time_predictor(min_prefill_instance);
-    request->estimated_ttft =
-        time_predictor.predict_ttft(request->model, request->token_ids.size());
-    request_metrics_[min_prefill_instance].estimated_prefill_time +=
-        request->estimated_ttft;
-  }
-
-  // If there are no decode instances that meet the requirements, switch a
-  // prefill instance to decode if the number of instances allows. Since the
-  // current disaggregated PD mode does not support prefill and decode using the
-  // same instance, we only switch the instance here, without dispatching the
-  // decode request to this instance.
-  float ttft_threshold = (prefill_index_.size() - 1.0f) / prefill_index_.size();
-  if (target_decode_instance.empty() &&
-      (avg_prefill_time < FLAGS_target_ttft * ttft_threshold ||
-       decode_index_.size() < prefill_index_.size())) {
-    flip_prefill_to_decode(request->routing.prefill_name);
-  }
+  
+  request->routing.prefill_name = best_instance;
 
   return true;
 }
@@ -1037,9 +952,11 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
       LOG(INFO) << "Model " << model_id << " on " << instance_name
                 << " trigger sleep success.";
       std::unique_lock<std::shared_mutex> inst_lock(instance_model_state_mutex_);
+      std::unique_lock<std::shared_mutex> model_count_lock(model_count_mutex_);
       std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
       instance_model_states_[instance_name][model_id] = ModelState::SLEEP;  // Sleep
       instance_memory_usage_[instance_name] -= get_model_memory_size(model_id);
+      model_count_[model_id] -= 1;
       if (instance_memory_usage_[instance_name] < 0) {
         LOG(WARNING) << "Instance " << instance_name
                      << " memory usage negative, reset to 0.";
@@ -1079,9 +996,11 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
     LOG(INFO) << "Model " << model_id << " on " << instance_name
               << " trigger wakeup success.";                
     std::unique_lock<std::shared_mutex> inst_lock(instance_model_state_mutex_);
+    std::unique_lock<std::shared_mutex> model_count_lock(model_count_mutex_);
     std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
     instance_model_states_[instance_name][model_id] = ModelState::WAKEUP;  // Wakeup
     instance_memory_usage_[instance_name] += get_model_memory_size(model_id);
+    model_count_[model_id] += 1;
     if (instance_memory_usage_[instance_name] > kMaxInstanceMemoryGB) {
       LOG(WARNING) << "Instance " << instance_name
                    << " memory usage exceeds max limit after waking up model "
@@ -1115,17 +1034,23 @@ double InstanceMgr::get_model_memory_size(const std::string& model_id) {
     return 20.0; 
 }
 
-std::string InstanceMgr::get_awake_instance(const std::string& model_id) {
+std::vector<std::string> InstanceMgr::get_awake_instances(const std::string& model_id) {
   std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
+  std::vector<std::string> awake_instances;
   for (const auto& instance_pair : instance_model_states_) {
     const std::string& instance_name = instance_pair.first;
     const auto& model_states = instance_pair.second;
     
     if (model_states.count(model_id) && model_states.at(model_id) == ModelState::WAKEUP) {
-      return instance_name;
+      awake_instances.push_back(instance_name);
     }
   }
-  return "";
+  return awake_instances;
+}
+
+int32_t InstanceMgr::get_model_count(const std::string& model_id) {
+  std::shared_lock<std::shared_mutex> lock(model_count_mutex_);
+  return model_count_[model_id];
 }
 
 void InstanceMgr::update_model_heat(const std::string& model_id, int64_t token_count) {
