@@ -231,10 +231,10 @@ std::vector<std::string> InstanceMgr::get_static_prefill_list(
 }
 
 static const std::vector<std::pair<std::string, std::string>> MODELS = {
-    {"Qwen3-8B", "/export/home/models/Qwen3-8B"},
-    {"Qwen2-7B", "/export/home/models/Qwen2-7B"},
+    {"Qwen3-8B", "/export/home/models/Qwen3-8B"}
+    // {"Qwen2-7B", "/export/home/models/Qwen2-7B"},
     // {"Qwen2.5-14B", "/export/home/models/Qwen2.5-14B"}
-    {"Qwen3-4B", "/export/home/models/Qwen3-4B"}
+    // {"Qwen3-4B", "/export/home/models/Qwen3-4B"}
     // {"Qwen2.5-3b", "/export/home/models/Qwen2.5-3b"}
     // {"Qwen3-30B-A3B-W8A8", "/export/home/models/Qwen3-30B-A3B-W8A8"},
     // {"Qwen3-32B-W8A8", "/export/home/models/Qwen3-32B-W8A8"}
@@ -437,7 +437,7 @@ void InstanceMgr::register_instance(const std::string& instance_name,
                << instance_name;
     return;
   }
-
+  
   if (!create_channel(instance_name)) {
     LOG(ERROR) << "create channel fail: " << instance_name;
     return;
@@ -453,7 +453,9 @@ void InstanceMgr::register_instance(const std::string& instance_name,
   // inst_mutex_ and fork_master_and_sleep calls send_http_request which calls
   // get_channel which acquires inst_mutex_ again (deadlock).
   auto channel = cached_channels_[instance_name];
-  fork_master_and_sleep(instance_name, channel);
+  threadpool_.schedule([this, instance_name, channel]() {
+    fork_master_and_sleep(instance_name, channel);
+  });
   {
     std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
     instance_memory_usage_[instance_name] = 0.0;
@@ -564,7 +566,6 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
           LOG(ERROR) << "pase json:" << json_str << " error!";
           continue;
         }
-
         put_map.insert(std::make_pair(instance_name, std::move(metainfo)));
 
       } else if (event.event_type() == etcd::Event::EventType::DELETE_) {
@@ -774,6 +775,10 @@ void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
     return;
   }
 
+  if (request->routing.decode_name.empty()) {
+    request->routing.decode_name = request->routing.prefill_name;
+  }
+
   auto decode_it = request_metrics_.find(request->routing.decode_name);
   if (decode_it == request_metrics_.end()) {
     LOG(ERROR) << "Failed to find instance request metrics, instance name : "
@@ -830,18 +835,19 @@ void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
       break;
   }
 
+  /*
   if (options_.load_balance_policy() == "SLO_AWARE" &&
       decode_it->second.decode_request_num == 0) {
     std::unique_lock<std::shared_mutex> instance_lock(inst_mutex_);
     flip_decode_to_prefill(request->routing.decode_name);
   }
+  */
 }
 
 bool InstanceMgr::select_instance_pair_on_slo(
     std::shared_ptr<Request> request) {
   std::unique_lock<std::shared_mutex> lock(inst_mutex_);
   std::lock_guard<std::mutex> request_metrics_lock(request_metrics_mutex_);
-
   auto awake_instances = get_awake_instances(request->model);
   if (awake_instances.empty()) {
     LOG(ERROR) << "No awake instance found for model " << request->model;
@@ -858,8 +864,13 @@ bool InstanceMgr::select_instance_pair_on_slo(
       min_prefill_time = prefill_time;
     }
   }
-  
+
   request->routing.prefill_name = best_instance;
+  auto& time_predictor = get_time_predictor(best_instance);
+  request->estimated_ttft =
+      time_predictor.predict_ttft(request->model, request->token_ids.size());
+  request_metrics_[best_instance].estimated_prefill_time +=
+      request->estimated_ttft;
 
   return true;
 }
@@ -929,46 +940,49 @@ TimePredictor& InstanceMgr::get_time_predictor(
 void InstanceMgr::send_model_sleep(const std::string& instance_name,
                                    const std::string& model_id) {
 
-    if (instance_name.empty() || instance_name == "all") {
-      LOG(ERROR) << "Only support fixed instance_name for model trigger now.";
-      return;
-    }
-
-    {
-      std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-      if (instance_model_states_[instance_name].count(model_id) &&
-          instance_model_states_[instance_name][model_id] == ModelState::SLEEP) {
-        LOG(INFO) << "Model " << model_id << " on " << instance_name
-                  << " is already sleeping.";
-        return;  // Already sleep
-      }
-    }
-
-    nlohmann::json sleep_body;
-    sleep_body["model_id"] = model_id;
-    sleep_body["master_status"] = 1;
-
-    if (send_http_request(instance_name, "/sleep", sleep_body.dump())) {
-      LOG(INFO) << "Model " << model_id << " on " << instance_name
-                << " trigger sleep success.";
-      std::unique_lock<std::shared_mutex> inst_lock(instance_model_state_mutex_);
-      std::unique_lock<std::shared_mutex> model_count_lock(model_count_mutex_);
-      std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
-      instance_model_states_[instance_name][model_id] = ModelState::SLEEP;  // Sleep
-      instance_memory_usage_[instance_name] -= get_model_memory_size(model_id);
-      model_count_[model_id] -= 1;
-      if (instance_memory_usage_[instance_name] < 0) {
-        LOG(WARNING) << "Instance " << instance_name
-                     << " memory usage negative, reset to 0.";
-        instance_memory_usage_[instance_name] = 0;
-      }
-
-    } else {
-      LOG(ERROR) << "Failed to sleep model " << model_id << " on "
-                << instance_name;
-    }
-
+  if (instance_name.empty() || instance_name == "all") {
+    LOG(ERROR) << "Only support fixed instance_name for model trigger now.";
+    return;
   }
+
+  // Use unique mutex for (instance_name, model_id) to serialize operations
+  std::mutex* op_mutex = get_op_mutex(instance_name, model_id);
+  std::lock_guard<std::mutex> lock(*op_mutex);
+
+  {
+    std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
+    if (instance_model_states_[instance_name].count(model_id) &&
+        instance_model_states_[instance_name][model_id] == ModelState::SLEEP) {
+      LOG(INFO) << "Model " << model_id << " on " << instance_name
+                << " is already sleeping.";
+      return;  // Already sleep
+    }
+  }
+
+  nlohmann::json sleep_body;
+  sleep_body["model_id"] = model_id;
+  sleep_body["master_status"] = 1;
+
+  if (send_http_request(instance_name, "/sleep", sleep_body.dump())) {
+    LOG(INFO) << "Model " << model_id << " on " << instance_name
+              << " trigger sleep success.";
+    std::unique_lock<std::shared_mutex> inst_lock(instance_model_state_mutex_);
+    std::unique_lock<std::shared_mutex> model_count_lock(model_count_mutex_);
+    std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
+    instance_model_states_[instance_name][model_id] = ModelState::SLEEP;  // Sleep
+    instance_memory_usage_[instance_name] -= get_model_memory_size(model_id);
+    model_count_[model_id] -= 1;
+    if (instance_memory_usage_[instance_name] < 0) {
+      LOG(WARNING) << "Instance " << instance_name
+                   << " memory usage negative, reset to 0.";
+      instance_memory_usage_[instance_name] = 0;
+    }
+
+  } else {
+    LOG(ERROR) << "Failed to sleep model " << model_id << " on "
+               << instance_name;
+  }
+}
 
 void InstanceMgr::send_model_wakeup(const std::string& instance_name,
                                     const std::string& model_id) {
@@ -977,7 +991,11 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
     LOG(ERROR) << "Only support fixed instance_name for model trigger now.";
     return;
   }
-  
+
+  // Use unique mutex for (instance_name, model_id) to serialize operations
+  std::mutex* op_mutex = get_op_mutex(instance_name, model_id);
+  std::lock_guard<std::mutex> lock(*op_mutex);
+
   {
     std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
     if (instance_model_states_[instance_name].count(model_id) &&
@@ -994,7 +1012,7 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
 
   if (send_http_request(instance_name, "/wakeup", wakeup_body.dump())) {
     LOG(INFO) << "Model " << model_id << " on " << instance_name
-              << " trigger wakeup success.";                
+              << " trigger wakeup success.";
     std::unique_lock<std::shared_mutex> inst_lock(instance_model_state_mutex_);
     std::unique_lock<std::shared_mutex> model_count_lock(model_count_mutex_);
     std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
@@ -1008,9 +1026,8 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
     }
   } else {
     LOG(ERROR) << "Failed to wakeup model " << model_id << " on "
-              << instance_name;
+               << instance_name;
   }
-
 }
 
 void InstanceMgr::init_model_memory_specs() {
@@ -1197,5 +1214,15 @@ std::vector<std::string> InstanceMgr::select_eviction_candidates(const std::stri
 
     return candidates;
   }
-
-}  // namespace xllm_service
+  
+  std::mutex* InstanceMgr::get_op_mutex(const std::string& instance_name,
+                                        const std::string& model_id) {
+    std::string key = instance_name + ":" + model_id;
+    std::lock_guard<std::mutex> lock(op_mutex_map_mutex_);
+    if (op_mutexes_.find(key) == op_mutexes_.end()) {
+      op_mutexes_[key] = std::make_unique<std::mutex>();
+    }
+    return op_mutexes_[key].get();
+  }
+  
+  }  // namespace xllm_service

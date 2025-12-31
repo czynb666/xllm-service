@@ -95,6 +95,8 @@ class InstanceMgr final {
   // Select models to evict on a specific instance to free up required_space
   std::vector<std::string> select_eviction_candidates(const std::string& instance_name, double required_space);
 
+  std::mutex* get_op_mutex(const std::string& instance_name, const std::string& model_id);
+
  private:
 
   // send_http_request(instance_name, ...) uses inst_mutex to get_channel()
@@ -176,6 +178,7 @@ class InstanceMgr final {
   std::mutex instance_memory_mutex_;
   std::unordered_map<std::string, double> instance_memory_usage_;
 
+  // stores InstanceMetaInfo before receiving heartbeat
   std::mutex pending_mutex_;
   std::unordered_map<std::string, InstanceMetaInfo> pending_infos_;
 
@@ -202,6 +205,9 @@ class InstanceMgr final {
   // token count, and decode request count.
   std::mutex request_metrics_mutex_;
   std::unordered_map<std::string, RequestMetrics> request_metrics_;
+
+  std::mutex op_mutex_map_mutex_;
+  std::unordered_map<std::string, std::unique_ptr<std::mutex>> op_mutexes_;
 
   ThreadPool threadpool_;
 };

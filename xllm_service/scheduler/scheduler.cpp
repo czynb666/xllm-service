@@ -98,7 +98,7 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
 
   // Check if model is already awake on any instance
   int32_t model_count = instance_mgr_->get_model_count(request->model);
-  
+
   // TODO: support lb_policy based routing among multiple awake instances
   if (model_count > 0) {
     lb_policy_->select_instances_pair(request);

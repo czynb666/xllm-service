@@ -28,7 +28,7 @@ class ThreadPool final {
   using Task = std::function<void()>;
 
   // constructors
-  ThreadPool() : ThreadPool(1) {}
+  ThreadPool() : ThreadPool(10) {}
 
   // disable copy/move constructor and assignment
   ThreadPool(const ThreadPool&) = delete;
