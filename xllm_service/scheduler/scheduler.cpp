@@ -56,6 +56,8 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
   if (is_master_service_) {
     heartbeat_thread_ = std::make_unique<std::thread>(
         &Scheduler::update_master_service_heartbeat, this);
+    auto_scaling_thread_ =
+        std::make_unique<std::thread>(&Scheduler::auto_scaling_task, this);
   } else {
     auto handle_master = std::bind(&Scheduler::handle_master_service_watch,
                                    this,
@@ -141,6 +143,13 @@ void Scheduler::update_master_service_heartbeat() {
   }
 }
 
+void Scheduler::auto_scaling_task() {
+  while (!exited_) {
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    instance_mgr_->auto_scaling();
+  }
+}
+
 void Scheduler::handle_instance_heartbeat(const proto::HeartbeatRequest* req) {
   if (exited_) {
     return;
@@ -164,6 +173,8 @@ void Scheduler::handle_master_service_watch(const etcd::Response& response,
 
     heartbeat_thread_ = std::make_unique<std::thread>(
         &Scheduler::update_master_service_heartbeat, this);
+    auto_scaling_thread_ =
+        std::make_unique<std::thread>(&Scheduler::auto_scaling_task, this);
 
     global_kvcache_mgr_->set_as_master();
     instance_mgr_->set_as_master();

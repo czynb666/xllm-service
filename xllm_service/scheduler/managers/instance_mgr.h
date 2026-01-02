@@ -21,6 +21,8 @@ limitations under the License.
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <deque>
+#include <chrono>
 
 #include "common/macros.h"
 #include "common/options.h"
@@ -34,6 +36,21 @@ limitations under the License.
 namespace xllm_service {
 
 class InstanceMgr final {
+ public:
+
+  const std::vector<std::pair<std::string, std::string>> MODELS = {
+    {"Qwen3-8B", "/export/home/models/Qwen3-8B"},
+    {"Qwen2-7B", "/export/home/models/Qwen2-7B"},
+    // {"Qwen2.5-14B", "/export/home/models/Qwen2.5-14B"}
+    {"Qwen3-4B", "/export/home/models/Qwen3-4B"}
+    // {"Qwen2.5-3b", "/export/home/models/Qwen2.5-3b"}
+    // {"Qwen3-30B-A3B-Instruct-2507", "/export/home/models/Qwen3-30B-A3B-Instruct-2507"}
+    // {"Qwen3-30B-A3B-W8A8", "/export/home/models/Qwen3-30B-A3B-W8A8"},
+    // {"Qwen3-32B-W8A8", "/export/home/models/Qwen3-32B-W8A8"}
+  };
+
+  std::atomic<uint16_t> master_node_port = 40000;
+
  public:
   explicit InstanceMgr(const Options& options,
                        const std::shared_ptr<EtcdClient>& etcd_client,
@@ -81,13 +98,15 @@ class InstanceMgr final {
                         const std::string& model_id);
 
   void send_model_wakeup(const std::string& instance_name,
-                         const std::string& model_id);
+                         const std::string& model_id,
+                         bool memory_increased_in_advance);
   
   int32_t get_model_count(const std::string& model_id);
 
   std::vector<std::string> get_awake_instances(const std::string& model_id);
   std::string allocate_instance_for_model(const std::string& model_id);
   void update_model_heat(const std::string& model_id, int64_t token_count);
+  void auto_scaling();
 
  private:
   void init_model_memory_specs();
@@ -96,6 +115,8 @@ class InstanceMgr final {
   std::vector<std::string> select_eviction_candidates(const std::string& instance_name, double required_space);
 
   std::mutex* get_op_mutex(const std::string& instance_name, const std::string& model_id);
+
+  void prune_model_heat_locked(const std::string& model_id);
 
  private:
 
@@ -146,7 +167,8 @@ class InstanceMgr final {
 
   enum class ModelState : int32_t {
     WAKEUP = 0,
-    SLEEP = 1
+    SLEEP = 1,
+    DRAINING = 2
   };
 
   // instances_, instance_model_states_, model_count_ use shared_mutex
@@ -170,6 +192,12 @@ class InstanceMgr final {
   // Global model heat (token count)
   std::mutex model_heat_mutex_;
   std::unordered_map<std::string, int64_t> global_model_heat_;
+
+  struct HeatRecord {
+    std::chrono::steady_clock::time_point timestamp;
+    int64_t token_count;
+  };
+  std::unordered_map<std::string, std::deque<HeatRecord>> model_heat_records_;
 
   std::shared_mutex model_count_mutex_;
   std::unordered_map<std::string, int32_t> model_count_;

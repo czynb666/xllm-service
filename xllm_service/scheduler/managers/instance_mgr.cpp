@@ -24,6 +24,7 @@ limitations under the License.
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <limits>
+#include <shared_mutex>
 
 #include "common/global_gflags.h"
 #include "common/types.h"
@@ -67,6 +68,7 @@ InstanceMgr::InstanceMgr(const Options& options,
 
 void InstanceMgr::init() {
   init_model_memory_specs();
+
   {
     std::unique_lock<std::shared_mutex> lock(inst_mutex_);
     for (auto& it : ETCD_KEYS_PREFIX_MAP) {
@@ -229,18 +231,6 @@ std::vector<std::string> InstanceMgr::get_static_prefill_list(
 
   return prefill_list;
 }
-
-static const std::vector<std::pair<std::string, std::string>> MODELS = {
-    {"Qwen3-8B", "/export/home/models/Qwen3-8B"}
-    // {"Qwen2-7B", "/export/home/models/Qwen2-7B"},
-    // {"Qwen2.5-14B", "/export/home/models/Qwen2.5-14B"}
-    // {"Qwen3-4B", "/export/home/models/Qwen3-4B"}
-    // {"Qwen2.5-3b", "/export/home/models/Qwen2.5-3b"}
-    // {"Qwen3-30B-A3B-W8A8", "/export/home/models/Qwen3-30B-A3B-W8A8"},
-    // {"Qwen3-32B-W8A8", "/export/home/models/Qwen3-32B-W8A8"}
-};
-
-static std::atomic<uint16_t> master_node_port = 40000;
 
 void InstanceMgr::fork_master_and_sleep(
     const std::string& instance_name,
@@ -471,6 +461,9 @@ void InstanceMgr::register_instance(const std::string& instance_name,
 
     // create request metrics for instance
     request_metrics_.emplace(instance_name, RequestMetrics());
+    for (auto& model : MODELS) {
+      request_metrics_[instance_name].model_metrics.try_emplace(model.first);
+    }
   }
 
   switch (metainfo.type) {
@@ -768,10 +761,19 @@ void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
                                          RequestAction action) {
   std::lock_guard<std::mutex> lock(request_metrics_mutex_);
 
-  auto prefill_it = request_metrics_.find(request->routing.prefill_name);
-  if (prefill_it == request_metrics_.end()) {
-    LOG(ERROR) << "Failed to find instance request metrics, instance name : "
+  auto prefill_instance_it = request_metrics_.find(request->routing.prefill_name);
+  if (prefill_instance_it == request_metrics_.end()) {
+    LOG(ERROR) << "Failed to find prefill instance request metrics, instance name : "
                << request->routing.prefill_name;
+    return;
+  }
+
+  auto prefill_model_it = prefill_instance_it->second.model_metrics.find(
+      request->model);
+  if (prefill_model_it == prefill_instance_it->second.model_metrics.end()) {
+    LOG(ERROR) << "Failed to find prefill model request metrics, instance name : "
+               << request->routing.prefill_name
+               << ", model id : " << request->model;
     return;
   }
 
@@ -779,11 +781,33 @@ void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
     request->routing.decode_name = request->routing.prefill_name;
   }
 
-  auto decode_it = request_metrics_.find(request->routing.decode_name);
-  if (decode_it == request_metrics_.end()) {
-    LOG(ERROR) << "Failed to find instance request metrics, instance name : "
+  auto decode_instance_it = request_metrics_.find(request->routing.decode_name);
+  if (decode_instance_it == request_metrics_.end()) {
+    LOG(ERROR) << "Failed to find decode instance request metrics, instance name : "
                << request->routing.decode_name;
     return;
+  }
+
+  auto decode_model_it = decode_instance_it->second.model_metrics.find(
+      request->model);
+  if (decode_model_it == decode_instance_it->second.model_metrics.end()) {
+    LOG(ERROR) << "Failed to find decode model request metrics, instance name : "
+               << request->routing.decode_name
+               << ", model id : " << request->model;
+    return;
+  }
+
+  if (action == RequestAction::SCHEDULE) {// prefill_instance.prefill_req += 1
+    if (prefill_model_it->second.prefill_request_num == 0 &&
+        prefill_model_it->second.decode_request_num == 0) {
+      prefill_model_it->second.busy_mutex_.lock();
+    }
+  } else if (action == RequestAction::FINISH_PREFILL) {// decode_instance.decode_req += 1
+    if (request->routing.prefill_name != request->routing.decode_name &&
+        decode_model_it->second.prefill_request_num == 0 &&
+        decode_model_it->second.decode_request_num == 0) {
+      decode_model_it->second.busy_mutex_.lock();
+    }
   }
 
   int64_t num_prompt_tokens = request->token_ids.size();
@@ -792,47 +816,69 @@ void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
     case RequestAction::SCHEDULE:
       // update the request metrics for prefill and decode instances when
       // request is scheduled
-      prefill_it->second.prefill_request_num += 1;
-      prefill_it->second.prefill_token_num += num_prompt_tokens;
+      prefill_model_it->second.prefill_request_num += 1;
+      prefill_model_it->second.prefill_token_num += num_prompt_tokens;
 
-      decode_it->second.decode_request_num += 1;
-      decode_it->second.decode_token_num += num_prompt_tokens;
+      decode_model_it->second.decode_request_num += 1;
+      decode_model_it->second.decode_token_num += num_prompt_tokens;
       break;
     case RequestAction::FINISH_PREFILL:
       // update the request metrics for prefill and decode instance when request
       // finishes the prefill phase
-      prefill_it->second.prefill_request_num -= 1;
-      prefill_it->second.prefill_token_num -= num_prompt_tokens;
-      prefill_it->second.estimated_prefill_time -= request->estimated_ttft;
+      prefill_model_it->second.prefill_request_num -= 1;
+      prefill_model_it->second.prefill_token_num -= num_prompt_tokens;
+      prefill_instance_it->second.estimated_prefill_time -= request->estimated_ttft;
 
-      decode_it->second.decode_token_num += 1;
+      decode_model_it->second.decode_token_num += 1;
       break;
     case RequestAction::GENERATE:
       // update the request metrics for decode instance when request generate a
       // token
-      decode_it->second.decode_token_num += 1;
+      decode_model_it->second.decode_token_num += 1;
       break;
     case RequestAction::FINISH_DECODE:
       // update the request metrics for decode instance when request finishes
       // the decode phase
-      decode_it->second.decode_request_num -= 1;
-      decode_it->second.decode_token_num -=
+      decode_model_it->second.decode_request_num -= 1;
+      decode_model_it->second.decode_token_num -=
           (num_prompt_tokens + num_generated_tokens);
       break;
     case RequestAction::CANCEL:
       // update the request metrics for prefill and decode instances when
       // request is cancelled
-      prefill_it->second.prefill_request_num -= 1;
-      prefill_it->second.prefill_token_num -= num_prompt_tokens;
-      prefill_it->second.estimated_prefill_time -= request->estimated_ttft;
+      prefill_model_it->second.prefill_request_num -= 1;
+      prefill_model_it->second.prefill_token_num -= num_prompt_tokens;
+      prefill_instance_it->second.estimated_prefill_time -= request->estimated_ttft;
 
-      decode_it->second.decode_request_num -= 1;
-      decode_it->second.decode_token_num -=
+      decode_model_it->second.decode_request_num -= 1;
+      decode_model_it->second.decode_token_num -=
           (num_prompt_tokens + num_generated_tokens);
       break;
     default:
       LOG(ERROR) << "Unknown RequestAction: " << static_cast<int32_t>(action);
       break;
+  }
+
+  if (action == RequestAction::FINISH_PREFILL) {// prefill_intance.prefill_req -= 1
+    if (prefill_model_it->second.prefill_request_num == 0 &&
+        prefill_model_it->second.decode_request_num == 0) {
+      prefill_model_it->second.busy_mutex_.unlock();
+    }
+  } else if (action == RequestAction::FINISH_DECODE) {// decode_instance.decode_req -= 1
+    if (decode_model_it->second.prefill_request_num == 0 &&
+        decode_model_it->second.decode_request_num == 0) {
+      decode_model_it->second.busy_mutex_.unlock();
+    }
+  } else if (action == RequestAction::CANCEL) {// prefill_instance.prefill_req -= 1, decode_instance.decode_req -= 1
+    if (prefill_model_it->second.prefill_request_num == 0 &&
+        prefill_model_it->second.decode_request_num == 0) {
+      prefill_model_it->second.busy_mutex_.unlock();
+    }
+    if (request->routing.prefill_name != request->routing.decode_name &&
+        decode_model_it->second.prefill_request_num == 0 &&
+        decode_model_it->second.decode_request_num == 0) {
+      decode_model_it->second.busy_mutex_.unlock();
+    }
   }
 
   /*
@@ -969,9 +1015,15 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
     std::unique_lock<std::shared_mutex> inst_lock(instance_model_state_mutex_);
     std::unique_lock<std::shared_mutex> model_count_lock(model_count_mutex_);
     std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
+    
+    if (instance_model_states_[instance_name][model_id] == ModelState::WAKEUP) {
+      // Only decrease model count if the model is not DRAINING
+      model_count_[model_id] -= 1;
+    }
+    
     instance_model_states_[instance_name][model_id] = ModelState::SLEEP;  // Sleep
     instance_memory_usage_[instance_name] -= get_model_memory_size(model_id);
-    model_count_[model_id] -= 1;
+
     if (instance_memory_usage_[instance_name] < 0) {
       LOG(WARNING) << "Instance " << instance_name
                    << " memory usage negative, reset to 0.";
@@ -985,7 +1037,8 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
 }
 
 void InstanceMgr::send_model_wakeup(const std::string& instance_name,
-                                    const std::string& model_id) {
+                                    const std::string& model_id,
+                                    bool memory_increased_in_advance) {// memory_increased_in_advance: for race conditions
 
   if (instance_name.empty() || instance_name == "all") {
     LOG(ERROR) << "Only support fixed instance_name for model trigger now.";
@@ -1015,10 +1068,14 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
               << " trigger wakeup success.";
     std::unique_lock<std::shared_mutex> inst_lock(instance_model_state_mutex_);
     std::unique_lock<std::shared_mutex> model_count_lock(model_count_mutex_);
-    std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
     instance_model_states_[instance_name][model_id] = ModelState::WAKEUP;  // Wakeup
-    instance_memory_usage_[instance_name] += get_model_memory_size(model_id);
     model_count_[model_id] += 1;
+
+    if (!memory_increased_in_advance) {
+      std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
+      instance_memory_usage_[instance_name] += get_model_memory_size(model_id);
+    }
+
     if (instance_memory_usage_[instance_name] > kMaxInstanceMemoryGB) {
       LOG(WARNING) << "Instance " << instance_name
                    << " memory usage exceeds max limit after waking up model "
@@ -1027,19 +1084,31 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
   } else {
     LOG(ERROR) << "Failed to wakeup model " << model_id << " on "
                << instance_name;
+    if (memory_increased_in_advance) {
+      std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
+      instance_memory_usage_[instance_name] -= get_model_memory_size(model_id);
+    }
   }
 }
 
 void InstanceMgr::init_model_memory_specs() {
     // Hardcoded memory specs: x * 2 + 5 GB. 5GB = 3GB KV cache + 2GB overhead
-    model_memory_specs_["Qwen3-8B"] = 8.0 * 2 + 5.0;
-    model_memory_specs_["Qwen2-7B"] = 7.0 * 2 + 5.0;
-    model_memory_specs_["Qwen2-7B-Instruct"] = 7.0 * 2 + 5.0;
-    model_memory_specs_["Qwen2.5-14B"] = 14.0 * 2 + 5.0;
-    model_memory_specs_["Qwen3-4B"] = 4.0 * 2 + 5.0;
-    model_memory_specs_["Qwen2.5-3b"] = 3.0 * 2 + 5.0;
-    model_memory_specs_["Qwen3-30B-A3B-W8A8"] = 30.0 + 5.0;
-    model_memory_specs_["Qwen3-32B-W8A8"] = 40.0 + 5.0;
+
+    // just for test
+    model_memory_specs_["Qwen3-4B"] = 25.0;
+    model_memory_specs_["Qwen2-7B"] = 25.0;
+    model_memory_specs_["Qwen3-8B"] = 25.0;
+    
+
+    // model_memory_specs_["Qwen3-8B"] = 8.0 * 2 + 5.0;// 21.0GB
+    // model_memory_specs_["Qwen2-7B"] = 7.0 * 2 + 5.0;// 19.0GB
+    // model_memory_specs_["Qwen2-7B-Instruct"] = 7.0 * 2 + 5.0;// 19.0GB
+    // model_memory_specs_["Qwen2.5-14B"] = 14.0 * 2 + 5.0;// 33.0GB
+    // model_memory_specs_["Qwen3-4B"] = 4.0 * 2 + 5.0;// 13.0GB
+    // model_memory_specs_["Qwen2.5-3b"] = 3.0 * 2 + 5.0;// 11.0GB
+    // model_memory_specs_["Qwen3-30B-A3B-Instruct-2507"] = 57.0 + 5.0;// 62.0GB
+    // model_memory_specs_["Qwen3-30B-A3B-W8A8"] = 30.0 + 5.0;// 35.0GB
+    // model_memory_specs_["Qwen3-32B-W8A8"] = 40.0 + 5.0;// 45.0GB
 }
 
 // TODO: support dynamic instance memory specs, rather than hardcoded.
@@ -1072,6 +1141,8 @@ int32_t InstanceMgr::get_model_count(const std::string& model_id) {
 
 void InstanceMgr::update_model_heat(const std::string& model_id, int64_t token_count) {
   std::lock_guard<std::mutex> lock(model_heat_mutex_);
+  prune_model_heat_locked(model_id);
+  model_heat_records_[model_id].push_back({std::chrono::steady_clock::now(), token_count});
   global_model_heat_[model_id] += token_count;
 }
 
@@ -1086,14 +1157,24 @@ std::string InstanceMgr::allocate_instance_for_model(const std::string& model_id
     std::unique_lock<std::mutex> mem_lock(instance_memory_mutex_);
     for (const auto& pair : instance_memory_usage_) {
       const std::string& instance_name = pair.first;
+
+      {
+        std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
+        if (instance_model_states_[instance_name][model_id] == ModelState::WAKEUP ||
+            instance_model_states_[instance_name][model_id] == ModelState::DRAINING) {
+          continue; // Model already awake or draining
+        }
+      }
+
       double current_usage = pair.second;
 
       LOG(INFO) << "Instance " << instance_name 
                 << " current memory usage: " << current_usage << " GB.";
 
       if (current_usage + model_size <= kMaxInstanceMemoryGB) {
+        instance_memory_usage_[instance_name] += model_size;
         mem_lock.unlock();
-        send_model_wakeup(instance_name, model_id);
+        send_model_wakeup(instance_name, model_id, /*memory_increased_in_advance*/ true);
         return instance_name;
       }
     }
@@ -1109,6 +1190,14 @@ std::string InstanceMgr::allocate_instance_for_model(const std::string& model_id
   std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_); // Iterate instances safely
   for (const auto& inst_pair : instances_) {
     std::string instance_name = inst_pair.first;
+
+    {
+      std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
+      if (instance_model_states_[instance_name][model_id] == ModelState::WAKEUP ||
+          instance_model_states_[instance_name][model_id] == ModelState::DRAINING) {
+        continue; // Model already awake or draining
+      }
+    }
     
     // Check current usage
     double current_usage = 0;
@@ -1146,11 +1235,54 @@ std::string InstanceMgr::allocate_instance_for_model(const std::string& model_id
   inst_lock.unlock();
 
   if (!best_candidate_instance.empty()) {
-    // Execute eviction
-    for (const auto& mod_to_sleep : best_eviction_plan) {
-      send_model_sleep(best_candidate_instance, mod_to_sleep);
+    {
+      std::unique_lock<std::shared_mutex> inst_lock(instance_model_state_mutex_);
+      std::unique_lock<std::shared_mutex> count_lock(model_count_mutex_);
+      for (const auto& mod_to_sleep : best_eviction_plan) {
+        instance_model_states_[best_candidate_instance][mod_to_sleep] = ModelState::DRAINING;
+        model_count_[mod_to_sleep] -= 1;
+      }
     }
-    send_model_wakeup(best_candidate_instance, model_id);
+
+    // Execute eviction
+
+    std::vector<std::thread> eviction_threads;
+
+    for (const auto& model_to_sleep : best_eviction_plan) {
+
+      eviction_threads.emplace_back([this, best_candidate_instance, model_to_sleep]() {
+        auto instance_it = request_metrics_.find(best_candidate_instance);
+        if (instance_it == request_metrics_.end()) {
+          LOG(ERROR) << "Failed to find request metrics for instance "
+                     << best_candidate_instance << " during eviction.";
+          return;
+        }
+        auto model_it = instance_it->second.model_metrics.find(model_to_sleep);
+        if (model_it == instance_it->second.model_metrics.end()) {
+          LOG(ERROR) << "Failed to find request metrics for model "
+                     << model_to_sleep << " on instance "
+                     << best_candidate_instance << " during eviction.";
+          return;
+        }
+        model_it->second.busy_mutex_.lock(); // Wait until no requests are using this model
+        send_model_sleep(best_candidate_instance, model_to_sleep);
+        model_it->second.busy_mutex_.unlock();
+      });
+      
+    }
+
+    for (auto& thread : eviction_threads) {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
+      instance_memory_usage_[best_candidate_instance] += model_size;
+    }
+
+    send_model_wakeup(best_candidate_instance, model_id, /*memory_increased_in_advance*/ true);
     return best_candidate_instance;
   }
 
@@ -1161,68 +1293,139 @@ std::string InstanceMgr::allocate_instance_for_model(const std::string& model_id
 std::vector<std::string> InstanceMgr::select_eviction_candidates(const std::string& instance_name, 
                                                                  double required_space) {
     
-    // Get all awake models on this instance
-    std::vector<std::string> awake_models;
-    {
-      std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-      if (instance_model_states_.count(instance_name)) {
-        for (const auto& pair : instance_model_states_.at(instance_name)) {
-          if (pair.second == ModelState::WAKEUP) { // Awake
-            awake_models.push_back(pair.first);
-          }
+  // Get all awake models on this instance
+  std::vector<std::string> awake_models;
+  {
+    std::shared_lock<std::shared_mutex> model_state_lock(instance_model_state_mutex_);
+    std::shared_lock<std::shared_mutex> model_count_lock(model_count_mutex_);
+    if (instance_model_states_.count(instance_name)) {
+      for (const auto& pair : instance_model_states_.at(instance_name)) {
+        if (pair.second == ModelState::WAKEUP &&
+            model_count_[pair.first] > 1) {
+          awake_models.push_back(pair.first);
         }
       }
     }
+  }
 
-    // Select models to evict enough space for the new model, meanwhile minimizing sum(heat)
-    std::vector<uint64_t> awake_model_heats;
-    {
-      std::lock_guard<std::mutex> lock(model_heat_mutex_);
-      for (const auto& model_id : awake_models) {
-        awake_model_heats.push_back(global_model_heat_[model_id]);
-      }
+  // Select models to evict enough space for the new model, meanwhile minimizing sum(heat)
+  std::vector<uint64_t> awake_model_heats;
+  {
+    std::lock_guard<std::mutex> lock(model_heat_mutex_);
+    for (const auto& model_id : awake_models) {
+      prune_model_heat_locked(model_id);
+      awake_model_heats.push_back(global_model_heat_[model_id]);
     }
+  }
 
-    uint64_t min_sum_heat = std::numeric_limits<uint64_t>::max();
-    size_t best_subset = 0;
-    for (size_t subset = 0; subset < 1 << awake_models.size(); ++subset) {
-      double current_sum_space = 0;
-      uint64_t current_sum_heat = 0;
-      for (size_t i = 0; i < awake_models.size(); ++i) {
-        if (subset & (1 << i)) {
-          current_sum_space += get_model_memory_size(awake_models[i]);
-          current_sum_heat += awake_model_heats[i];
-        }
-      }
-      if (current_sum_space >= required_space && 
-          current_sum_heat < min_sum_heat) {
-        min_sum_heat = current_sum_heat;
-        best_subset = subset;
-      }
-    }
-
-    if (best_subset == 0) {
-      return {};// Cannot free enough space even if we evict everything
-    }
-
-    std::vector<std::string> candidates;
+  uint64_t min_sum_heat = std::numeric_limits<uint64_t>::max();
+  size_t best_subset = 0;
+  for (size_t subset = 0; subset < 1 << awake_models.size(); ++subset) {
+    double current_sum_space = 0;
+    uint64_t current_sum_heat = 0;
     for (size_t i = 0; i < awake_models.size(); ++i) {
-      if (best_subset & (1 << i)) {
-        candidates.push_back(awake_models[i]);
+      if (subset & (1 << i)) {
+        current_sum_space += get_model_memory_size(awake_models[i]);
+        current_sum_heat += awake_model_heats[i];
       }
     }
-
-    return candidates;
-  }
-  
-  std::mutex* InstanceMgr::get_op_mutex(const std::string& instance_name,
-                                        const std::string& model_id) {
-    std::string key = instance_name + ":" + model_id;
-    std::lock_guard<std::mutex> lock(op_mutex_map_mutex_);
-    if (op_mutexes_.find(key) == op_mutexes_.end()) {
-      op_mutexes_[key] = std::make_unique<std::mutex>();
+    if (current_sum_space >= required_space && 
+        current_sum_heat < min_sum_heat) {
+      min_sum_heat = current_sum_heat;
+      best_subset = subset;
     }
-    return op_mutexes_[key].get();
+  }
+
+  if (best_subset == 0) {
+    return {};// Cannot free enough space even if we evict everything
+  }
+
+  std::vector<std::string> candidates;
+  for (size_t i = 0; i < awake_models.size(); ++i) {
+    if (best_subset & (1 << i)) {
+      candidates.push_back(awake_models[i]);
+    }
+  }
+
+  return candidates;
+}
+  
+std::mutex* InstanceMgr::get_op_mutex(const std::string& instance_name,
+                                      const std::string& model_id) {
+  std::string key = instance_name + ":" + model_id;
+  std::lock_guard<std::mutex> lock(op_mutex_map_mutex_);
+  if (op_mutexes_.find(key) == op_mutexes_.end()) {
+    op_mutexes_[key] = std::make_unique<std::mutex>();
+  }
+  return op_mutexes_[key].get();
+}
+
+void InstanceMgr::auto_scaling() {
+  LOG(INFO) << "Running auto scaling task...";
+  
+  // 1. Identify the hottest model
+  std::string hottest_model = "";
+  int64_t max_heat = 0;
+  
+  {
+    std::lock_guard<std::mutex> lock(model_heat_mutex_);
+    for (const auto& pair : global_model_heat_) {
+      prune_model_heat_locked(pair.first);
+      if (pair.second > max_heat) {
+        max_heat = pair.second;
+        hottest_model = pair.first;
+      }
+    }
+  }
+
+  if (hottest_model.empty()) {
+    LOG(INFO) << "No model heat data available for auto scaling.";
+    return;
   }
   
-  }  // namespace xllm_service
+  LOG(INFO) << "Current model heats:";
+  {
+    std::lock_guard<std::mutex> lock(model_heat_mutex_);
+    for (const auto& pair : global_model_heat_) {
+      LOG(INFO) << "Model " << pair.first << ": Heat = " << pair.second;
+    }
+  }
+
+  LOG(INFO) << "Hottest model: " << (hottest_model.empty() ? "None" : hottest_model) << " with heat: " << max_heat;
+
+
+  {
+    std::shared_lock<std::shared_mutex> lock(model_count_mutex_);
+    if (model_count_[hottest_model] == 2) {
+      LOG(INFO) << "No need to scale up, model " << hottest_model << " already has 2 instances.";
+      return;
+    }
+  }
+
+  auto instance_name = allocate_instance_for_model(hottest_model);
+
+  if (instance_name.empty()) {
+    LOG(ERROR) << "Auto scaling failed: unable to allocate instance for model " << hottest_model;
+  } else {
+    LOG(INFO) << "Auto scaling: allocated instance " << instance_name << " for hottest model " << hottest_model;
+  }
+}
+
+void InstanceMgr::prune_model_heat_locked(const std::string& model_id) {
+  auto& records = model_heat_records_[model_id];
+  auto now = std::chrono::steady_clock::now();
+  while (!records.empty()) {
+    auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - records.front().timestamp).count();
+    if (duration > 5) {
+      global_model_heat_[model_id] -= records.front().token_count;
+      records.pop_front();
+    } else {
+      break;
+    }
+  }
+  if (global_model_heat_[model_id] < 0) {
+      global_model_heat_[model_id] = 0;
+  }
+}
+
+}  // namespace xllm_service

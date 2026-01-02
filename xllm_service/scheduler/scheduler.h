@@ -80,6 +80,8 @@ class Scheduler final {
   void handle_master_service_watch(const etcd::Response& response,
                                    const uint64_t& prefix_len);
 
+  void auto_scaling_task();
+
   Tokenizer* get_tls_tokenizer();
 
  private:
@@ -105,6 +107,7 @@ class Scheduler final {
   std::unique_ptr<LoadBalancePolicy> lb_policy_;
 
   std::unique_ptr<std::thread> heartbeat_thread_;
+  std::unique_ptr<std::thread> auto_scaling_thread_;
 
   // `service request id` -> `request` map
   std::unordered_map<std::string, std::shared_ptr<Request>> requests_;

@@ -94,7 +94,8 @@ void handle_first_response(brpc::Controller* cntl,
                            std::shared_ptr<T> call_data,
                            Scheduler* scheduler,
                            std::string service_request_id,
-                           bool stream) {
+                           bool stream,
+                           bool enable_disagg_pd) {
   // update request metrics for prefill finished request
   scheduler->update_request_metrics_for_prefill(service_request_id);
 
@@ -103,9 +104,24 @@ void handle_first_response(brpc::Controller* cntl,
     LOG(WARNING) << "Fail to send stream generation, " << cntl->ErrorText();
     return;
   }
-  if (stream) {
-    // write first token from prefill
-    call_data->write(cntl->response_attachment().to_string());
+
+  // 1. If enable disagg pd mode, we only receive the first token from prefill
+  // instance. The rest of tokens will be received via rpc service.
+  //
+  // 2. If not enable disagg pd mode, we receive all tokens from prefill
+  // instance.
+  if (enable_disagg_pd) {
+    if (stream) {
+      // write first token from prefill
+      call_data->write(cntl->response_attachment().to_string());
+    }
+  } else {
+    if (stream) {
+      call_data->write(cntl->response_attachment().to_string());
+    } else {
+      call_data->write_and_finish(cntl->response_attachment().to_string());
+      scheduler->finish_request(service_request_id);
+    }
   }
   // non-stream, all generated tokens will be sent from decode via rpc service.
 }
@@ -181,13 +197,15 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
     // 1. tokens will be received via rpc channel.
     //
     if (enable_decode_response_to_service_) {
+      auto instance_info = scheduler_->get_instance_info(request->routing.prefill_name);
       google::protobuf::Closure* done =
           brpc::NewCallback(&handle_first_response<T>,
                             redirect_cntl,
                             call_data,
                             scheduler_,
                             request->service_request_id,
-                            request->stream);
+                            request->stream,
+                            instance_info.enable_disagg_pd);
       channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
       if (redirect_cntl->Failed()) {
         LOG(ERROR) << "Redirect to instance error: "
@@ -537,7 +555,7 @@ void XllmHttpServiceImpl::ModelTriggers(
               << " for model " << model_id << " on instance "
               << instance_name;
     scheduler_->get_instance_mgr()->send_model_wakeup(
-        instance_name, model_id);
+        instance_name, model_id, /*memory_increased_in_advance*/ false);
   } else {
     LOG(ERROR) << "Invalid trigger type: " << trigger_type;
     cntl->SetFailed("Invalid trigger type: " + trigger_type);

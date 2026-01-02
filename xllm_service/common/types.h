@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <shared_mutex>
 #include <chrono>
 #include <cstdint>
 #include <nlohmann/json.hpp>
@@ -137,20 +138,21 @@ enum class RequestAction : int32_t {
 
 // Record the request metrics of the instance
 struct RequestMetrics {
-  RequestMetrics()
-      : prefill_request_num(0),
-        prefill_token_num(0),
-        decode_request_num(0),
-        decode_token_num(0),
-        estimated_prefill_time(0) {}
 
-  int64_t prefill_request_num;
-  int64_t prefill_token_num;
+  struct ModelRequestMetrics {
+    std::mutex busy_mutex_;
+    int64_t prefill_request_num = 0;
+    int64_t prefill_token_num = 0;
+    int64_t decode_request_num = 0;
+    int64_t decode_token_num = 0;
+  };
 
-  int64_t decode_request_num;
-  int64_t decode_token_num;
+  RequestMetrics() = default;
 
-  // Estimated execution time for all prefill requests on the instance.
+  // model_id -> metrics
+  std::unordered_map<std::string, ModelRequestMetrics> model_metrics;
+
+  // Estimated execution time for all prefill requests for all models on the instance.
   // The unit is milliseconds.
   int64_t estimated_prefill_time;
 };
@@ -177,6 +179,7 @@ struct InstanceMetaInfo {
   std::vector<uint64_t> k_cache_ids;
   std::vector<uint64_t> v_cache_ids;
   int32_t dp_size;
+  bool enable_disagg_pd = false;
 
   // ttft profiling data per model: model_id -> profiling_data
   std::unordered_map<std::string, std::vector<std::pair<int32_t, double>>> ttft_profiling_data;
@@ -202,6 +205,7 @@ struct InstanceMetaInfo {
     json_val["k_cache_ids"] = k_cache_ids;
     json_val["v_cache_ids"] = v_cache_ids;
     json_val["dp_size"] = dp_size;
+    json_val["enable_disagg_pd"] = enable_disagg_pd;
     
     // Serialize ttft_profiling_data as object with model_id keys
     nlohmann::json ttft_json;
@@ -250,6 +254,10 @@ struct InstanceMetaInfo {
       }
 
       dp_size = json_value.at("dp_size").get<int32_t>();
+
+      if (json_value.contains("enable_disagg_pd")) {
+        enable_disagg_pd = json_value.at("enable_disagg_pd").get<bool>();
+      }
 
       // Parse ttft_profiling_data as object with model_id keys
       if (json_value.contains("ttft_profiling_data")) {
