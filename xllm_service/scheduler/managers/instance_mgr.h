@@ -50,6 +50,8 @@ class InstanceMgr final {
   };
 
   std::atomic<uint16_t> master_node_port = 40000;
+  
+  static constexpr int kMaxWakeupTimeoutms = 5000;
 
  public:
   explicit InstanceMgr(const Options& options,
@@ -104,7 +106,15 @@ class InstanceMgr final {
   int32_t get_model_count(const std::string& model_id);
 
   std::vector<std::string> get_awake_instances(const std::string& model_id);
-  std::string allocate_instance_for_model(const std::string& model_id);
+
+  bool is_model_waking_up(const std::string& model_id);
+  std::string wait_for_model_wakeup(const std::string& model_id,
+                                    std::chrono::milliseconds timeout_ms);
+  void notify_model_wakeup(const std::string& model_id,
+                           const std::string& instance_name);
+
+  std::string allocate_instance_for_model(const std::string& model_id,
+                                          int32_t target_model_count);
   void update_model_heat(const std::string& model_id, int64_t token_count);
   void auto_scaling();
 
@@ -168,7 +178,9 @@ class InstanceMgr final {
   enum class ModelState : int32_t {
     WAKEUP = 0,
     SLEEP = 1,
-    DRAINING = 2
+    DRAINING = 2,
+    WAKING_UP = 3,
+    SENDING_WAKEUP_REQUEST = 4
   };
 
   // instances_, instance_model_states_, model_count_ use shared_mutex
@@ -188,6 +200,7 @@ class InstanceMgr final {
   std::shared_mutex instance_model_state_mutex_;
   std::unordered_map<std::string, std::unordered_map<std::string, ModelState>>
       instance_model_states_;
+  std::unordered_map<std::string, int32_t> model_waking_up_counts_;
 
   // Global model heat (token count)
   std::mutex model_heat_mutex_;
@@ -236,6 +249,12 @@ class InstanceMgr final {
 
   std::mutex op_mutex_map_mutex_;
   std::unordered_map<std::string, std::unique_ptr<std::mutex>> op_mutexes_;
+
+  std::mutex wakeup_mutex_;
+  std::condition_variable wakeup_cv_;
+  std::unordered_map<std::string, std::string> wakeup_instance_name_;
+
+  std::mutex allocation_mutex_;
 
   ThreadPool threadpool_;
 };

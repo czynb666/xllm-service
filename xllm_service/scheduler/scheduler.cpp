@@ -101,19 +101,39 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
   // Check if model is already awake on any instance
   int32_t model_count = instance_mgr_->get_model_count(request->model);
 
-  // TODO: support lb_policy based routing among multiple awake instances
   if (model_count > 0) {
     lb_policy_->select_instances_pair(request);
   } else {
-      // Model is sleeping everywhere, need to allocate space and wake up
-      std::string allocated_instance = instance_mgr_->allocate_instance_for_model(request->model);
-      if (!allocated_instance.empty()) {
-          request->routing.prefill_name = allocated_instance;
-          request->routing.decode_name = allocated_instance;
+
+    bool is_waking_up = instance_mgr_->is_model_waking_up(request->model);
+    if (is_waking_up) {
+      
+      auto instance_name = instance_mgr_->wait_for_model_wakeup(request->model,
+                                                                std::chrono::milliseconds(instance_mgr_->kMaxWakeupTimeoutms));
+      if (!instance_name.empty()) {
+        request->routing.prefill_name = instance_name;
+        request->routing.decode_name = instance_name;
       } else {
-          LOG(ERROR) << "Failed to allocate instance for model " << request->model;
-          return false;
+        LOG(ERROR) << "Failed to get instance for waking up model " << request->model;
+        return false;
       }
+    } else {
+      std::string allocated_instance = instance_mgr_->allocate_instance_for_model(request->model, /*target_model_count*/ 1);
+
+      instance_mgr_->notify_model_wakeup(request->model, allocated_instance);
+
+      if (!allocated_instance.empty()) {
+        LOG(INFO) << "Allocated instance " << allocated_instance << " for model " << request->model;
+        request->routing.prefill_name = allocated_instance;
+        request->routing.decode_name = allocated_instance;
+      } else {
+        LOG(ERROR) << "Failed to allocate instance for model " << request->model;
+        return false;
+      }
+    }
+
+    // Model is sleeping everywhere, need to allocate space and wake up
+    
   }
 
   DLOG(INFO) << request->routing.debug_string();
