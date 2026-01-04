@@ -18,6 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <shared_mutex>
+#include <condition_variable>
 #include <chrono>
 #include <cstdint>
 #include <nlohmann/json.hpp>
@@ -140,7 +141,7 @@ enum class RequestAction : int32_t {
 struct RequestMetrics {
 
   struct ModelRequestMetrics {
-    std::mutex busy_mutex_;
+    std::condition_variable cv_idle;
     int64_t prefill_request_num = 0;
     int64_t prefill_token_num = 0;
     int64_t decode_request_num = 0;
