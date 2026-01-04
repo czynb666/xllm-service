@@ -20,6 +20,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <chrono>
+#include <thread>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -242,9 +243,20 @@ void InstanceMgr::fork_master_and_sleep(
     fork_body["master_node_addr"] = "127.0.0.1:" + std::to_string(++master_node_port);
     fork_body["master_status"] = 0;
 
-    if (!send_http_request(channel, "/fork_master", fork_body.dump())) {
+    bool fork_success = false;
+    for (int i = 0; i < 10; ++i) {
+      if (send_http_request(channel, "/fork_master", fork_body.dump())) {
+        fork_success = true;
+        break;
+      }
+      LOG(WARNING) << "Failed to fork master for model " << model.first << " on "
+                   << instance_name << ", retry " << i + 1;
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    if (!fork_success) {
       LOG(ERROR) << "Failed to fork master for model " << model.first << " on "
-                 << instance_name;
+                 << instance_name << " after retries";
       continue;
     }
 
@@ -797,19 +809,6 @@ void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
     return;
   }
 
-  if (action == RequestAction::SCHEDULE) {// prefill_instance.prefill_req += 1
-    if (prefill_model_it->second.prefill_request_num == 0 &&
-        prefill_model_it->second.decode_request_num == 0) {
-      prefill_model_it->second.busy_mutex_.lock();
-    }
-  } else if (action == RequestAction::FINISH_PREFILL) {// decode_instance.decode_req += 1
-    if (request->routing.prefill_name != request->routing.decode_name &&
-        decode_model_it->second.prefill_request_num == 0 &&
-        decode_model_it->second.decode_request_num == 0) {
-      decode_model_it->second.busy_mutex_.lock();
-    }
-  }
-
   int64_t num_prompt_tokens = request->token_ids.size();
   int64_t num_generated_tokens = request->num_generated_tokens;
   switch (action) {
@@ -859,26 +858,21 @@ void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
       break;
   }
 
-  if (action == RequestAction::FINISH_PREFILL) {// prefill_intance.prefill_req -= 1
+  if (action == RequestAction::FINISH_PREFILL ||
+      action == RequestAction::FINISH_DECODE ||
+      action == RequestAction::CANCEL) {
+
     if (prefill_model_it->second.prefill_request_num == 0 &&
         prefill_model_it->second.decode_request_num == 0) {
-      prefill_model_it->second.busy_mutex_.unlock();
+      prefill_model_it->second.cv_idle.notify_all();
     }
-  } else if (action == RequestAction::FINISH_DECODE) {// decode_instance.decode_req -= 1
-    if (decode_model_it->second.prefill_request_num == 0 &&
-        decode_model_it->second.decode_request_num == 0) {
-      decode_model_it->second.busy_mutex_.unlock();
-    }
-  } else if (action == RequestAction::CANCEL) {// prefill_instance.prefill_req -= 1, decode_instance.decode_req -= 1
-    if (prefill_model_it->second.prefill_request_num == 0 &&
-        prefill_model_it->second.decode_request_num == 0) {
-      prefill_model_it->second.busy_mutex_.unlock();
-    }
+
     if (request->routing.prefill_name != request->routing.decode_name &&
         decode_model_it->second.prefill_request_num == 0 &&
         decode_model_it->second.decode_request_num == 0) {
-      decode_model_it->second.busy_mutex_.unlock();
+      decode_model_it->second.cv_idle.notify_all();
     }
+
   }
 
   /*
@@ -1012,7 +1006,7 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
   if (send_http_request(instance_name, "/sleep", sleep_body.dump())) {
     LOG(INFO) << "Model " << model_id << " on " << instance_name
               << " trigger sleep success.";
-    std::unique_lock<std::shared_mutex> inst_lock(instance_model_state_mutex_);
+    std::unique_lock<std::shared_mutex> model_state_lock(instance_model_state_mutex_);
     std::unique_lock<std::shared_mutex> model_count_lock(model_count_mutex_);
     std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
     
@@ -1199,7 +1193,7 @@ std::string InstanceMgr::allocate_instance_for_model(const std::string& model_id
   
   std::unique_lock<std::mutex> allocation_lock(allocation_mutex_);
   // check for race conditions
-  // (multiple entrance in of allocate_instance_for_model)
+  // (multiple entrance in allocate_instance_for_model)
   {
     std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
     std::shared_lock<std::shared_mutex> model_state_lock(instance_model_state_mutex_);
@@ -1238,9 +1232,13 @@ std::string InstanceMgr::allocate_instance_for_model(const std::string& model_id
 
       {
         std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-        if (instance_model_states_[instance_name][model_id] == ModelState::WAKEUP ||
-            instance_model_states_[instance_name][model_id] == ModelState::DRAINING) {
-          continue; // Model already awake or draining
+        if (instance_model_states_[instance_name][model_id] != ModelState::SLEEP) {
+          // Model not ready to wake up.
+          // Note that DRAINING does not contribute to model_waking_up_counts,
+          // but expecting DRAINING->SLEEP->WAKEUP_AGAIN yields too much race conditions.
+          // We would rather expect a temporary -1 margin on model_waking_up_counts,
+          // which is to be fixed by triggering allocate_instance_for_model again during the next auto_scaling.
+          continue;
         }
       }
 
@@ -1250,8 +1248,13 @@ std::string InstanceMgr::allocate_instance_for_model(const std::string& model_id
                 << " current memory usage: " << current_usage << " GB.";
 
       if (current_usage + model_size <= kMaxInstanceMemoryGB) {
+        std::unique_lock<std::shared_mutex> model_state_lock(instance_model_state_mutex_);
         instance_memory_usage_[instance_name] += model_size;
+        instance_model_states_[instance_name][model_id] = ModelState::WAKING_UP;
+        model_waking_up_counts_[model_id] += 1;
+        model_state_lock.unlock();
         mem_lock.unlock();
+        allocation_lock.unlock();
         send_model_wakeup(instance_name, model_id, /*memory_increased_in_advance*/ true);
         return instance_name;
       }
@@ -1272,9 +1275,10 @@ std::string InstanceMgr::allocate_instance_for_model(const std::string& model_id
 
       {
         std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-        if (instance_model_states_[instance_name][model_id] == ModelState::WAKEUP ||
-            instance_model_states_[instance_name][model_id] == ModelState::DRAINING) {
-          continue; // Model already awake or draining
+        if (instance_model_states_[instance_name][model_id] != ModelState::SLEEP) {
+          // Model not ready.
+          // This double check is for race conditions. (After allocation_lock, are there race conditions?)
+          continue;
         }
       }
       
@@ -1319,7 +1323,7 @@ std::string InstanceMgr::allocate_instance_for_model(const std::string& model_id
       std::unique_lock<std::shared_mutex> count_lock(model_count_mutex_);
       
       // early mark as WAKING_UP, for race conditions 
-      // (multiple entrance in THE EVICTION ZONE of allocate_instance_for_model)
+      // (multiple entrance in allocate_instance_for_model)
       instance_model_states_[best_candidate_instance][model_id] = ModelState::WAKING_UP;
       model_waking_up_counts_[model_id] += 1;
       for (const auto& model_to_sleep : best_eviction_plan) {
@@ -1336,6 +1340,7 @@ std::string InstanceMgr::allocate_instance_for_model(const std::string& model_id
     for (const auto& model_to_sleep : best_eviction_plan) {
 
       eviction_threads.emplace_back([this, best_candidate_instance, model_to_sleep]() {
+        std::unique_lock<std::mutex> request_metrics_lock(request_metrics_mutex_);
         auto instance_it = request_metrics_.find(best_candidate_instance);
         if (instance_it == request_metrics_.end()) {
           LOG(ERROR) << "Failed to find request metrics for instance "
@@ -1349,9 +1354,14 @@ std::string InstanceMgr::allocate_instance_for_model(const std::string& model_id
                      << best_candidate_instance << " during eviction.";
           return;
         }
-        model_it->second.busy_mutex_.lock(); // Wait until no requests are using this model
+        
+        auto& metrics = model_it->second;
+        metrics.cv_idle.wait(request_metrics_lock, [&metrics]() {
+          return metrics.prefill_request_num == 0 && metrics.decode_request_num == 0;
+        });
+        
+        request_metrics_lock.unlock();
         send_model_sleep(best_candidate_instance, model_to_sleep);
-        model_it->second.busy_mutex_.unlock();
       });
       
     }
@@ -1367,6 +1377,7 @@ std::string InstanceMgr::allocate_instance_for_model(const std::string& model_id
       instance_memory_usage_[best_candidate_instance] += model_size;
     }
 
+    allocation_lock.unlock();
     send_model_wakeup(best_candidate_instance, model_id, /*memory_increased_in_advance*/ true);
     return best_candidate_instance;
   } else {
@@ -1391,6 +1402,14 @@ std::vector<std::string> InstanceMgr::select_eviction_candidates(const std::stri
         if (pair.second == ModelState::WAKEUP &&
             model_count_[pair.first] > 1) {
           awake_models.push_back(pair.first);
+        }
+        if (pair.second == ModelState::WAKEUP &&
+            model_count_[pair.first] == 1) {
+          std::lock_guard<std::mutex> lock(model_heat_mutex_);
+          prune_model_heat_locked(pair.first);
+          if (global_model_heat_[pair.first] == 0) {
+            awake_models.push_back(pair.first);
+          }
         }
       }
     }
@@ -1449,18 +1468,28 @@ std::mutex* InstanceMgr::get_op_mutex(const std::string& instance_name,
 }
 
 void InstanceMgr::auto_scaling() {
-  
   // 1. Identify the hottest model
   std::string hottest_model = "";
   int64_t max_heat = 0;
+
+  std::string second_hottest_model = "";
+  int64_t second_max_heat = 0;
   
   {
     std::lock_guard<std::mutex> lock(model_heat_mutex_);
     for (const auto& pair : global_model_heat_) {
       prune_model_heat_locked(pair.first);
       if (pair.second > max_heat) {
+
+        second_max_heat = max_heat;
+        second_hottest_model = hottest_model;
+
         max_heat = pair.second;
         hottest_model = pair.first;
+
+      } else if (pair.second > second_max_heat) {
+        second_max_heat = pair.second;
+        second_hottest_model = pair.first;
       }
     }
   }
@@ -1479,21 +1508,50 @@ void InstanceMgr::auto_scaling() {
 
   LOG(INFO) << "Hottest model: " << (hottest_model.empty() ? "None" : hottest_model) << " with heat: " << max_heat;
 
+  bool hottest_model_needs_scale_up = true;
 
   {
     std::shared_lock<std::shared_mutex> lock(model_count_mutex_);
     if (model_count_[hottest_model] == 2) {
-      LOG(INFO) << "No need to scale up, model " << hottest_model << " already has 2 instances.";
-      return;
+      LOG(INFO) << "No need to scale up, hottest model " << hottest_model << " already has 2 instances.";
+      hottest_model_needs_scale_up = false;
     }
   }
 
-  auto instance_name = allocate_instance_for_model(hottest_model, /*target_model_count*/ 2);
+  if (hottest_model_needs_scale_up) {
+    auto instance_name = allocate_instance_for_model(hottest_model, /*target_model_count*/ 2);
 
-  if (instance_name.empty()) {
-    LOG(ERROR) << "Auto scaling failed: unable to allocate instance for model " << hottest_model;
-  } else {
-    LOG(INFO) << "Auto scaling: allocated instance " << instance_name << " for hottest model " << hottest_model;
+    if (instance_name.empty()) {
+      LOG(ERROR) << "Auto scaling failed: unable to allocate instance for hottest model " << hottest_model;
+    } else {
+      LOG(INFO) << "Auto scaling: allocated instance " << instance_name << " for hottest model " << hottest_model;
+    }
+  }
+
+  if (second_hottest_model.empty()) {
+    return;
+  }
+
+  bool second_hottest_model_needs_scale_up = true;
+
+  LOG(INFO) << "Second hottest model: " << second_hottest_model << " with heat: " << second_max_heat;
+
+  {
+    std::shared_lock<std::shared_mutex> lock(model_count_mutex_);
+    if (model_count_[second_hottest_model] == 2) {
+      LOG(INFO) << "No need to scale up, second hottest model " << second_hottest_model << " already has 2 instances.";
+      second_hottest_model_needs_scale_up = false;
+    }
+  }
+
+  if (second_hottest_model_needs_scale_up) {
+    auto instance_name = allocate_instance_for_model(second_hottest_model, /*target_model_count*/ 2);
+
+    if (instance_name.empty()) {
+      LOG(ERROR) << "Auto scaling failed: unable to allocate instance for second hottest model " << second_hottest_model;
+    } else {
+      LOG(INFO) << "Auto scaling: allocated instance " << instance_name << " for second hottest model " << second_hottest_model;
+    }
   }
 }
 
@@ -1510,7 +1568,7 @@ void InstanceMgr::prune_model_heat_locked(const std::string& model_id) {
     }
   }
   if (global_model_heat_[model_id] < 0) {
-      global_model_heat_[model_id] = 0;
+    global_model_heat_[model_id] = 0;
   }
 }
 

@@ -51,7 +51,7 @@ class InstanceMgr final {
 
   std::atomic<uint16_t> master_node_port = 40000;
   
-  static constexpr int kMaxWakeupTimeoutms = 5000;
+  static constexpr int kMaxWakeupTimeoutms = 10000;
 
  public:
   explicit InstanceMgr(const Options& options,
