@@ -41,7 +41,7 @@ class InstanceMgr final {
   const std::vector<std::pair<std::string, std::string>> MODELS = {
     {"Qwen3-8B", "/export/home/models/Qwen3-8B"},
     {"Qwen2-7B", "/export/home/models/Qwen2-7B"},
-    // {"Qwen2.5-14B", "/export/home/models/Qwen2.5-14B"}
+    {"Qwen2.5-14B", "/export/home/models/Qwen2.5-14B"},
     {"Qwen3-4B", "/export/home/models/Qwen3-4B"}
     // {"Qwen2.5-3b", "/export/home/models/Qwen2.5-3b"}
     // {"Qwen3-30B-A3B-Instruct-2507", "/export/home/models/Qwen3-30B-A3B-Instruct-2507"}
@@ -113,8 +113,8 @@ class InstanceMgr final {
   void notify_model_wakeup(const std::string& model_id,
                            const std::string& instance_name);
 
-  std::string allocate_instance_for_model(const std::string& model_id,
-                                          int32_t target_model_count);
+  std::vector<std::string> allocate_instance_for_model(const std::string& model_id,
+                                                       int32_t target_model_count);
   void update_model_heat(const std::string& model_id, int64_t token_count);
   void auto_scaling();
 
@@ -122,7 +122,7 @@ class InstanceMgr final {
   void init_model_memory_specs();
   double get_model_memory_size(const std::string& model_id);
   // Select models to evict on a specific instance to free up required_space
-  std::vector<std::string> select_eviction_candidates(const std::string& instance_name, double required_space);
+  EvictionPlanInfo select_eviction_candidates(const std::string& instance_name, double required_space);
 
   std::mutex* get_op_mutex(const std::string& instance_name, const std::string& model_id);
 

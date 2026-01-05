@@ -21,6 +21,8 @@ limitations under the License.
 #include "loadbalance_policy/slo_aware_policy.h"
 #include "tokenizer/tokenizer_factory.h"
 
+#include <thread>
+
 static constexpr int kHeartbeatInterval = 3;  // in seconds
 static std::string ETCD_MASTER_SERVICE_KEY = "XLLM:SERVICE:MASTER";
 
@@ -105,36 +107,32 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
     lb_policy_->select_instances_pair(request);
   } else {
 
-    bool is_waking_up = instance_mgr_->is_model_waking_up(request->model);
-    if (is_waking_up) {
-      
-      auto instance_name = instance_mgr_->wait_for_model_wakeup(request->model,
-                                                                std::chrono::milliseconds(instance_mgr_->kMaxWakeupTimeoutms));
-      if (!instance_name.empty()) {
-        request->routing.prefill_name = instance_name;
-        request->routing.decode_name = instance_name;
-      } else {
-        LOG(ERROR) << "Failed to get instance for waking up model " << request->model;
-        return false;
-      }
-    } else {
-      std::string allocated_instance = instance_mgr_->allocate_instance_for_model(request->model, /*target_model_count*/ 1);
+    // to be refactored by request queue.
+    // this just works now, I don't want to change it now (multiple threads do Scheduler::schedule)
 
-      instance_mgr_->notify_model_wakeup(request->model, allocated_instance);
+    auto newly_allocated_instances = instance_mgr_->allocate_instance_for_model(request->model, /*target_model_count*/ 1);
 
-      if (!allocated_instance.empty()) {
-        LOG(INFO) << "Allocated instance " << allocated_instance << " for model " << request->model;
-        request->routing.prefill_name = allocated_instance;
-        request->routing.decode_name = allocated_instance;
-      } else {
-        LOG(ERROR) << "Failed to allocate instance for model " << request->model;
-        return false;
+    std::string awake_instance = "";
+
+    for (int retry_count = 0; retry_count < 10; retry_count++) {// wait for the allocated instance to WAKEUP
+      auto awake_instances = 
+        instance_mgr_->get_awake_instances(request->model);
+      if (awake_instances.size() > 0) {
+        awake_instance = awake_instances[0];
+        break;
       }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+    
+    if (awake_instance.empty()) {
+      LOG(ERROR) << "Failed to get awake instances for expected waking up model " << request->model;
+      return false;
     }
 
-    // Model is sleeping everywhere, need to allocate space and wake up
-    
-  }
+    request->routing.prefill_name = awake_instance;
+    request->routing.decode_name = awake_instance;
+
+  }    
 
   DLOG(INFO) << request->routing.debug_string();
   

@@ -436,6 +436,14 @@ struct LoadBalanceInfos {
   }
 };
 
+struct EvictionPlanInfo {
+  std::string instance_name;
+  int64_t heat_sum;
+  std::vector<std::string> models_to_evict;
+
+  EvictionPlanInfo() = default;
+};
+
 // Function call related types
 struct JsonFunction {
   std::string name;
