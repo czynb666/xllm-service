@@ -176,19 +176,18 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
   }
 
   // async redistribute the request and wait the response
-  // TODO: optimize the thread pool to async mode.
-  auto& target_uri = request->routing.prefill_name;
-  brpc::Channel* channel_ptr = scheduler_->get_channel(target_uri).get();
+  // thread_pool_->schedule([this,
+  //                         request,
+  //                         req_attachment = std::move(req_attachment),
+  //                         call_data,
+  //                         channel_ptr,
+  //                         target_uri = target_uri + method]() {
+  {
+    auto& target_uri = request->routing.prefill_name;
+    brpc::Channel* channel_ptr = scheduler_->get_channel(target_uri).get();
 
-  // send request to prefill instance.
-  thread_pool_->schedule([this,
-                          request,
-                          req_attachment = std::move(req_attachment),
-                          call_data,
-                          channel_ptr,
-                          target_uri = target_uri + method]() {
     brpc::Controller* redirect_cntl = new brpc::Controller();
-    redirect_cntl->http_request().uri() = target_uri.c_str();
+    redirect_cntl->http_request().uri() = (target_uri + method).c_str();
     redirect_cntl->http_request().set_method(brpc::HTTP_METHOD_POST);
 
     // redirect the input request content
@@ -197,7 +196,8 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
     // 1. tokens will be received via rpc channel.
     //
     if (enable_decode_response_to_service_) {
-      auto instance_info = scheduler_->get_instance_info(request->routing.prefill_name);
+      auto instance_info =
+          scheduler_->get_instance_info(request->routing.prefill_name);
       google::protobuf::Closure* done =
           brpc::NewCallback(&handle_first_response<T>,
                             redirect_cntl,
@@ -251,7 +251,7 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
         return;
       }
     }
-  });
+  };
 }
 
 template <typename T>
@@ -320,37 +320,47 @@ void XllmHttpServiceImpl::get_serving(
       cntl, false, done_guard.release(), nullptr);
 
   auto service_request = std::make_shared<Request>();
+
+  std::weak_ptr<Request> weak_service_request = service_request;
+  service_request->dispatch_callback = [this,
+                                        weak_service_request,
+                                        call_data,
+                                        cntl,
+                                        serving_method,
+                                        done]() {
+    auto service_request = weak_service_request.lock();
+    if (service_request == nullptr) {
+      return;
+    }
+    brpc::Channel* channel_ptr =
+        scheduler_->get_channel(service_request->routing.prefill_name).get();
+    std::string target_uri =
+        service_request->routing.prefill_name + serving_method;
+
+    brpc::Controller* redirect_cntl = new brpc::Controller();
+    redirect_cntl->http_request().uri() = target_uri.c_str();
+    redirect_cntl->http_request().set_method(brpc::HTTP_METHOD_GET);
+
+    google::protobuf::Closure* callback_done = brpc::NewCallback(
+        &handle_get_response, redirect_cntl, call_data, done);
+
+    // Because `done'(last parameter) is NULL, this function waits until
+    // the response comes back or error occurs(including timeout).
+    channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, callback_done);
+    if (redirect_cntl->Failed()) {
+      LOG(ERROR) << "Redirect to instance error: "
+                 << redirect_cntl->ErrorText();
+      call_data->finish_with_error(redirect_cntl->ErrorText());
+      delete callback_done;
+      delete redirect_cntl;
+    }
+  };
+
   if (!scheduler_->schedule(service_request)) {
     cntl->SetFailed("Schedule request failed!");
     LOG(ERROR) << "Schedule request failed!";
     return;
   }
-
-  brpc::Channel* channel_ptr =
-      scheduler_->get_channel(service_request->routing.prefill_name).get();
-  std::string target_uri =
-      service_request->routing.prefill_name + serving_method;
-
-  thread_pool_->schedule(
-      [/*req_attachment, */ call_data, cntl, channel_ptr, target_uri]() {
-        brpc::Controller* redirect_cntl = new brpc::Controller();
-        redirect_cntl->http_request().uri() = target_uri.c_str();
-        redirect_cntl->http_request().set_method(brpc::HTTP_METHOD_GET);
-
-        google::protobuf::Closure* done = brpc::NewCallback(
-            &handle_get_response, redirect_cntl, call_data, done);
-
-        // Because `done'(last parameter) is NULL, this function waits until
-        // the response comes back or error occurs(including timeout).
-        channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
-        if (redirect_cntl->Failed()) {
-          LOG(ERROR) << "Redirect to instance error: "
-                     << redirect_cntl->ErrorText();
-          call_data->finish_with_error(redirect_cntl->ErrorText());
-          delete done;
-          delete redirect_cntl;
-        }
-      });
 }
 
 void XllmHttpServiceImpl::Completions(
@@ -387,6 +397,39 @@ void XllmHttpServiceImpl::Completions(
 
   auto service_request = generate_request(req_pb, "/v1/completions");
 
+  auto call_data = std::make_shared<CompletionCallData>(
+      cntl, service_request->stream, done_guard.release(), resp_pb);
+
+  std::weak_ptr<Request> weak_service_request = service_request;
+  service_request->dispatch_callback = [this,
+                                        weak_service_request,
+                                        req_pb,
+                                        call_data,
+                                        cntl]() {
+    auto service_request = weak_service_request.lock();
+    if (service_request == nullptr) {
+      return;
+    }
+    // update request protobuf
+    req_pb->set_service_request_id(service_request->service_request_id);
+    req_pb->mutable_token_ids()->Add(service_request->token_ids.begin(),
+                                     service_request->token_ids.end());
+    req_pb->mutable_routing()->set_prefill_name(
+        service_request->routing.prefill_name);
+    req_pb->mutable_routing()->set_decode_name(
+        service_request->routing.decode_name);
+
+    std::string req_attachment;
+    if (!json2pb::ProtoMessageToJson(*req_pb, &req_attachment)) {
+      // cntl->SetFailed("proto to json failed");
+      LOG(ERROR) << "proto to json failed";
+      call_data->finish_with_error("proto to json failed");
+      return;
+    }
+
+    handle(call_data, req_attachment, service_request, "/v1/completions");
+  };
+
   if (!req_pb->prompt().empty()) {
     service_request->prompt = req_pb->prompt();
     // select instance for request
@@ -400,26 +443,6 @@ void XllmHttpServiceImpl::Completions(
     LOG(ERROR) << "Prompt is empty!";
     return;
   }
-
-  // update request protobuf
-  req_pb->set_service_request_id(service_request->service_request_id);
-  req_pb->mutable_token_ids()->Add(service_request->token_ids.begin(),
-                                   service_request->token_ids.end());
-  req_pb->mutable_routing()->set_prefill_name(
-      service_request->routing.prefill_name);
-  req_pb->mutable_routing()->set_decode_name(
-      service_request->routing.decode_name);
-
-  std::string req_attachment;
-  if (!json2pb::ProtoMessageToJson(*req_pb, &req_attachment)) {
-    cntl->SetFailed("proto to json failed");
-    LOG(ERROR) << "proto to json failed";
-    return;
-  }
-
-  auto call_data = std::make_shared<CompletionCallData>(
-      cntl, service_request->stream, done_guard.release(), resp_pb);
-  handle(call_data, req_attachment, service_request, "/v1/completions");
 }
 
 void XllmHttpServiceImpl::ChatCompletions(
@@ -454,6 +477,39 @@ void XllmHttpServiceImpl::ChatCompletions(
 
   auto service_request = generate_request(req_pb, "/v1/chat/completions");
 
+  auto call_data = std::make_shared<ChatCallData>(
+      cntl, service_request->stream, done_guard.release(), resp_pb);
+
+  std::weak_ptr<Request> weak_service_request = service_request;
+  service_request->dispatch_callback = [this,
+                                        weak_service_request,
+                                        req_pb,
+                                        call_data,
+                                        cntl]() {
+    auto service_request = weak_service_request.lock();
+    if (service_request == nullptr) {
+      return;
+    }
+    // update request protobuf
+    req_pb->set_service_request_id(service_request->service_request_id);
+    req_pb->mutable_token_ids()->Add(service_request->token_ids.begin(),
+                                     service_request->token_ids.end());
+    req_pb->mutable_routing()->set_prefill_name(
+        service_request->routing.prefill_name);
+    req_pb->mutable_routing()->set_decode_name(
+        service_request->routing.decode_name);
+
+    std::string req_attachment;
+    if (!json2pb::ProtoMessageToJson(*req_pb, &req_attachment)) {
+      // cntl->SetFailed("proto to json failed");
+      LOG(ERROR) << "proto to json failed";
+      call_data->finish_with_error("proto to json failed");
+      return;
+    }
+
+    handle(call_data, req_attachment, service_request, "/v1/chat/completions");
+  };
+
   if (req_pb->messages_size() > 0) {
     service_request->messages.reserve(req_pb->messages_size());
     for (const auto& message : req_pb->messages()) {
@@ -470,26 +526,6 @@ void XllmHttpServiceImpl::ChatCompletions(
     LOG(ERROR) << "Messages is empty!";
     return;
   }
-
-  // update request protobuf
-  req_pb->set_service_request_id(service_request->service_request_id);
-  req_pb->mutable_token_ids()->Add(service_request->token_ids.begin(),
-                                   service_request->token_ids.end());
-  req_pb->mutable_routing()->set_prefill_name(
-      service_request->routing.prefill_name);
-  req_pb->mutable_routing()->set_decode_name(
-      service_request->routing.decode_name);
-
-  std::string req_attachment;
-  if (!json2pb::ProtoMessageToJson(*req_pb, &req_attachment)) {
-    cntl->SetFailed("proto to json failed");
-    LOG(ERROR) << "proto to json failed";
-    return;
-  }
-
-  auto call_data = std::make_shared<ChatCallData>(
-      cntl, service_request->stream, done_guard.release(), resp_pb);
-  handle(call_data, req_attachment, service_request, "/v1/chat/completions");
 }
 
 void XllmHttpServiceImpl::Embeddings(

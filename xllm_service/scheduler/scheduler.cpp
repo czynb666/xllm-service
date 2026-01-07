@@ -69,7 +69,18 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
   }
 }
 
-Scheduler::~Scheduler() { etcd_client_->stop_watch(); }
+Scheduler::~Scheduler() {
+  exited_ = true;
+  for (auto& queue_pair : request_queues_) {
+    queue_pair.second->emplace(nullptr);  // unblock queue
+  }
+  for (auto& thread_pair : processing_threads_) {
+    if (thread_pair.second->joinable()) {
+      thread_pair.second->join();
+    }
+  }
+  etcd_client_->stop_watch();
+}
 
 bool Scheduler::schedule(std::shared_ptr<Request> request) {
   // apply chat template
@@ -100,50 +111,84 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
     instance_mgr_->update_model_heat(request->model, request->token_ids.size());
   }
 
-  // Check if model is already awake on any instance
-  int32_t model_count = instance_mgr_->get_model_count(request->model);
-
-  if (model_count > 0) {
-    lb_policy_->select_instances_pair(request);
-  } else {
-
-    // to be refactored by request queue.
-    // this just works now, I don't want to change it now (multiple threads do Scheduler::schedule)
-
-    auto newly_allocated_instances = instance_mgr_->allocate_instance_for_model(request->model, /*target_model_count*/ 1);
-
-    std::string awake_instance = "";
-
-    for (int retry_count = 0; retry_count < 10; retry_count++) {// wait for the allocated instance to WAKEUP
-      auto awake_instances = 
-        instance_mgr_->get_awake_instances(request->model);
-      if (awake_instances.size() > 0) {
-        awake_instance = awake_instances[0];
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  // Push request to queue
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    if (request_queues_.find(request->model) == request_queues_.end()) {
+      request_queues_[request->model] =
+          std::make_shared<ConcurrentQueue<std::shared_ptr<Request>>>();
+      processing_threads_[request->model] = std::make_unique<std::thread>(
+          &Scheduler::process_request_queue, this, request->model);
     }
-    
-    if (awake_instance.empty()) {
-      LOG(ERROR) << "Failed to get awake instances for expected waking up model " << request->model;
-      return false;
-    }
-
-    request->routing.prefill_name = awake_instance;
-    request->routing.decode_name = awake_instance;
-
-  }    
-
-  DLOG(INFO) << request->routing.debug_string();
-  
-  bool ret = !request->routing.prefill_name.empty();
-
-  // update request metrics
-  if (request->prompt.size() != 0) {
-    instance_mgr_->update_request_metrics(request, RequestAction::SCHEDULE);
+    request_queues_[request->model]->push(request);
   }
 
-  return ret;
+  return true;
+}
+
+void Scheduler::process_request_queue(const std::string& model_name) {
+  while (!exited_) {
+    std::shared_ptr<ConcurrentQueue<std::shared_ptr<Request>>> queue;
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      if (request_queues_.find(model_name) == request_queues_.end()) {
+        break;
+      }
+      queue = request_queues_[model_name];
+    }
+
+    auto request = queue->pop();
+    if (request == nullptr) {
+      continue;
+    }
+
+    // Check if model is already awake on any instance
+    int32_t model_count = instance_mgr_->get_model_count(request->model);
+
+    if (model_count > 0) {
+      lb_policy_->select_instances_pair(request);
+    } else {
+      // allocate instance for model
+      auto newly_allocated_instances = instance_mgr_->allocate_instance_for_model(
+          request->model, /*target_model_count*/ 1);
+
+      std::string awake_instance = "";
+
+      for (int retry_count = 0; retry_count < 10;
+           retry_count++) {  // wait for the allocated instance to WAKEUP
+        auto awake_instances =
+            instance_mgr_->get_awake_instances(request->model);
+        if (awake_instances.size() > 0) {
+          awake_instance = awake_instances[0];
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      }
+
+      if (awake_instance.empty()) {
+        LOG(ERROR) << "Failed to get awake instances for expected waking up "
+                      "model "
+                   << request->model;
+        // push back to queue to retry? or just fail?
+        // for now just fail and let the client retry
+        continue;
+      }
+
+      request->routing.prefill_name = awake_instance;
+      request->routing.decode_name = awake_instance;
+    }
+
+    DLOG(INFO) << request->routing.debug_string();
+
+    // update request metrics
+    if (request->prompt.size() != 0) {
+      instance_mgr_->update_request_metrics(request, RequestAction::SCHEDULE);
+    }
+
+    if (request->dispatch_callback) {
+      std::thread([request]() { request->dispatch_callback(); }).detach();
+    }
+  }
 }
 
 std::shared_ptr<brpc::Channel> Scheduler::get_channel(

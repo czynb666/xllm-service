@@ -1481,9 +1481,8 @@ std::mutex* InstanceMgr::get_op_mutex(const std::string& instance_name,
 }
 
 void InstanceMgr::auto_scaling() {
-
   const int hottest_model_target_count = 4;
-  const int second_hottest_model_target_count = 2;
+  const int second_hottest_model_target_count = 3;
 
   // 1. Identify the hottest and second hottest model
   std::string hottest_model = "";
@@ -1564,7 +1563,7 @@ void InstanceMgr::auto_scaling() {
     std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
     second_hottest_model_count_margin = second_hottest_model_target_count - model_waking_up_counts_[second_hottest_model];
     if (model_waking_up_counts_[second_hottest_model] >= second_hottest_model_target_count) {
-      LOG(INFO) << "No need to scale up, hottest model " << hottest_model << " already has " << second_hottest_model_target_count << " instances.";
+      LOG(INFO) << "No need to scale up, second hottest model " << second_hottest_model << " already has " << second_hottest_model_target_count << " instances.";
       second_hottest_model_needs_scale_up = false;
     }
   }

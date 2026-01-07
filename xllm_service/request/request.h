@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include <absl/synchronization/mutex.h>
+
 #include "chat_template/jinja_chat_template.h"
 #include "common/types.h"
 #include "common/xllm/output.h"
@@ -60,6 +62,13 @@ struct Request {
 
   // trace callback
   std::function<void(const std::string&)> trace_callback = nullptr;
+
+  // dispatch callback
+  // This callback will be called in a new thread after the request is scheduled.
+  std::function<void()> dispatch_callback = nullptr;
+
+  absl::Mutex mutex;
+  bool is_scheduled = false;
 };
 
 }  // namespace xllm_service

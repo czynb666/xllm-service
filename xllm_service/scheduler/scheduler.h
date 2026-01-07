@@ -17,6 +17,7 @@ limitations under the License.
 
 #include "chat_template/jinja_chat_template.h"
 #include "common/call_data.h"
+#include "common/concurrent_queue.h"
 #include "common/options.h"
 #include "common/threadpool.h"
 #include "common/xllm/output.h"
@@ -82,6 +83,8 @@ class Scheduler final {
 
   void auto_scaling_task();
 
+  void process_request_queue(const std::string& model_name);
+
   Tokenizer* get_tls_tokenizer();
 
  private:
@@ -108,6 +111,17 @@ class Scheduler final {
 
   std::unique_ptr<std::thread> heartbeat_thread_;
   std::unique_ptr<std::thread> auto_scaling_thread_;
+
+  // `model name` -> `request queue` map
+  std::unordered_map<std::string,
+                     std::shared_ptr<ConcurrentQueue<std::shared_ptr<Request>>>>
+      request_queues_;
+  std::mutex queue_mutex_;
+
+  // `model name` -> `processing thread` map
+  std::unordered_map<std::string, std::unique_ptr<std::thread>>
+      processing_threads_;
+
 
   // `service request id` -> `request` map
   std::unordered_map<std::string, std::shared_ptr<Request>> requests_;
