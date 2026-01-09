@@ -31,6 +31,7 @@ limitations under the License.
 #include "common/types.h"
 #include "request/request.h"
 #include "scheduler/etcd_client/etcd_client.h"
+#include "scheduler/managers/model_instance_mgr.h"
 #include "xllm_rpc_service.pb.h"
 
 namespace xllm_service {
@@ -102,31 +103,26 @@ class InstanceMgr final {
   void send_model_wakeup(const std::string& instance_name,
                          const std::string& model_id,
                          bool memory_increased_in_advance);
+
+  void update_model_heat(const std::string& model_id,
+                         int64_t token_count);
   
-  int32_t get_model_count(const std::string& model_id);
+  int32_t get_wakeup_count(const std::string& model_id);
 
   std::vector<std::string> get_awake_instances(const std::string& model_id);
-
   bool is_model_waking_up(const std::string& model_id);
-  std::string wait_for_model_wakeup(const std::string& model_id,
-                                    std::chrono::milliseconds timeout_ms);
-  void notify_model_wakeup(const std::string& model_id,
-                           const std::string& instance_name);
 
   std::vector<std::string> allocate_instance_for_model(const std::string& model_id,
                                                        int32_t target_model_count);
-  void update_model_heat(const std::string& model_id, int64_t token_count);
   void auto_scaling();
+
+  ModelInstanceMgr* get_model_instance_mgr(const std::string& model_id);
 
  private:
   void init_model_memory_specs();
   double get_model_memory_size(const std::string& model_id);
   // Select models to evict on a specific instance to free up required_space
   EvictionPlanInfo select_eviction_candidates(const std::string& instance_name, double required_space);
-
-  std::mutex* get_op_mutex(const std::string& instance_name, const std::string& model_id);
-
-  void prune_model_heat_locked(const std::string& model_id);
 
  private:
 
@@ -175,45 +171,17 @@ class InstanceMgr final {
   // model_id -> memory_spec (GB)
   std::unordered_map<std::string, double> model_memory_specs_;
 
-  enum class ModelState : int32_t {
-    WAKEUP = 0,
-    SLEEP = 1,
-    DRAINING = 2,
-    WAKING_UP = 3,
-    SENDING_WAKEUP_REQUEST = 4
-  };
-
   // instances_, instance_model_states_, model_count_ use shared_mutex
   // because they only change when instance registration or model state changes
-  // global_model_heat_ and instance_memory_usage_ use mutex 
+  // global_model_heat_ and instance_memory_usage_ use mutex
   // because they change frequently when requests come
   // pending_infos_ use mutex because there's no read-only operations
   
   std::shared_mutex inst_mutex_;
   std::unordered_map<std::string, InstanceMetaInfo> instances_;
-  std::vector<std::string> prefill_index_;
-  std::vector<std::string> decode_index_;
 
-  std::unordered_map<std::string, uint32_t> next_prefill_index_;
-  std::unordered_map<std::string, uint32_t> next_decode_index_;
-
-  std::shared_mutex instance_model_state_mutex_;
-  std::unordered_map<std::string, std::unordered_map<std::string, ModelState>>
-      instance_model_states_;
-  std::unordered_map<std::string, int32_t> model_waking_up_counts_;
-
-  // Global model heat (token count)
-  std::mutex model_heat_mutex_;
-  std::unordered_map<std::string, int64_t> global_model_heat_;
-
-  struct HeatRecord {
-    std::chrono::steady_clock::time_point timestamp;
-    int64_t token_count;
-  };
-  std::unordered_map<std::string, std::deque<HeatRecord>> model_heat_records_;
-
-  std::shared_mutex model_count_mutex_;
-  std::unordered_map<std::string, int32_t> model_count_;
+  std::shared_mutex model_instance_mgr_mutex_;
+  std::unordered_map<std::string, std::shared_ptr<ModelInstanceMgr>> model_instance_mgrs_;
 
   // instance_name -> current_memory_usage (GB)
   std::mutex instance_memory_mutex_;
@@ -246,14 +214,7 @@ class InstanceMgr final {
   // token count, and decode request count.
   std::mutex request_metrics_mutex_;
   std::unordered_map<std::string, RequestMetrics> request_metrics_;
-
-  std::mutex op_mutex_map_mutex_;
-  std::unordered_map<std::string, std::unique_ptr<std::mutex>> op_mutexes_;
-
-  std::mutex wakeup_mutex_;
-  std::condition_variable wakeup_cv_;
-  std::unordered_map<std::string, std::string> wakeup_instance_name_;
-
+  
   std::mutex allocation_mutex_;
 
   ThreadPool threadpool_;

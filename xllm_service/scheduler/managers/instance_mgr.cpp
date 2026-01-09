@@ -89,49 +89,46 @@ void InstanceMgr::init() {
     }
     LOG(INFO) << "Load instance info from etcd:" << instances_.size();
     std::vector<std::string> channel_creat_fail_insts;
-    prefill_index_.reserve(instances_.size());
-    decode_index_.reserve(instances_.size());
-
     for (auto& ist : instances_) {
       if (!create_channel(ist.first)) {
         channel_creat_fail_insts.emplace_back(ist.first);
       } else {
-        switch (ist.second.type) {
-          case InstanceType::DEFAULT:
-          case InstanceType::PREFILL:
-            ist.second.instance_index = prefill_index_.size();
-            prefill_index_.emplace_back(ist.first);
-            LOG(INFO) << "Register a new prefill instance, instance name : "
-                      << ist.first;
-            break;
-          case InstanceType::DECODE:
-            ist.second.instance_index = decode_index_.size();
-            decode_index_.emplace_back(ist.first);
-            LOG(INFO) << "Register a new decode instance, instance name : "
-                      << ist.first;
-            break;
-          case InstanceType::MIX:
-            // In the initial state, we set the first MIX type instance as a
-            // decode instance, while all subsequent instances are set as
-            // prefill instances.
-            if (decode_index_.size() > 0) {
-              ist.second.instance_index = prefill_index_.size();
-              ist.second.current_type = InstanceType::PREFILL;
-              prefill_index_.emplace_back(ist.first);
-              LOG(INFO) << "Register a new prefill instance, instance name : "
-                        << ist.first;
-            } else {
-              ist.second.instance_index = decode_index_.size();
-              ist.second.current_type = InstanceType::DECODE;
-              decode_index_.emplace_back(ist.first);
-              LOG(INFO) << "Register a new decode instance, instance name : "
-                        << ist.first;
-            }
-            break;
-          default:
-            LOG(WARNING) << "Unknown InstanceType: " << int(ist.second.type);
-            channel_creat_fail_insts.emplace_back(ist.first);
-            break;
+        std::unique_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+        // TODO: support multi-model registration, currently assuming instances serve all models or we need info from somewhere
+        // For now, assuming instances serve all known models, or we need to parse from InstanceMetaInfo which model it serves
+        // But InstanceMetaInfo struct doesn't have model list. Assuming homogenous cluster or we need to add model info to registration.
+        // Assuming simple case: register to all ModelInstanceMgrs corresponding to served models.
+        // But wait, InstanceMetaInfo structure is:
+        /*
+        struct InstanceMetaInfo {
+            std::string name;
+            std::string ip;
+            int32_t port;
+            InstanceType type;
+            InstanceType current_type;
+            int32_t instance_index;
+            ...
+        };
+        */
+        // It lacks model info. In multi-model world, we need to know which model an instance serves.
+        // The prompt says "string model_id mapped to ModelInstanceMgr".
+        // Assuming existing code structure, maybe we register instance to ALL model mgrs?
+        // Or we need to look at how `get_next_instance_pair` uses `model_id`.
+        // It seems `InstanceMgr` was serving one model type implicitly or mixing them up?
+        // Ah, `get_next_instance_pair` takes `model_id`.
+        // The original code had `prefill_index_` etc. which were GLOBAL for all models?
+        // Yes, "InstanceMgr ... was only supporting one model type".
+        // Now "multi-model".
+        // We should iterate over supported models and create managers?
+        // Or create manager on demand?
+        
+        // Let's create managers for all hardcoded MODELS for now.
+        for (const auto& model_pair : MODELS) {
+          std::string model_id = model_pair.first;
+          if (model_instance_mgrs_.find(model_id) == model_instance_mgrs_.end()) {
+             model_instance_mgrs_[model_id] = std::make_shared<ModelInstanceMgr>(model_id);
+          }
+          model_instance_mgrs_[model_id]->add_instance(ist.first, ist.second);
         }
       }
     }
@@ -151,9 +148,6 @@ void InstanceMgr::init() {
     etcd_client_->get_prefix(ETCD_LOADMETRICS_PREFIX, &load_metrics_);
   }
 
-  for (int i = 0; i < prefill_index_.size(); i++) {
-    LOG(INFO) << i << " : " << prefill_index_[i];
-  }
 }
 
 InstanceMgr::~InstanceMgr() { exited_ = true; }
@@ -171,42 +165,28 @@ InstanceMetaInfo InstanceMgr::get_instance_info(
 }
 
 bool InstanceMgr::get_next_instance_pair(const std::string& model_id, Routing* routing) {
-  std::unique_lock<std::shared_mutex> lock(inst_mutex_);
-  if (prefill_index_.empty()) {
-    LOG(ERROR) << "No prefill or default instance found for model " << model_id;
+  std::shared_lock<std::shared_mutex> lock(model_instance_mgr_mutex_);
+  auto it = model_instance_mgrs_.find(model_id);
+  if (it == model_instance_mgrs_.end()) {
+    LOG(ERROR) << "Model manager not found for model " << model_id;
     return false;
   }
-
-  {
-    std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-    int32_t now_prefill_index = next_prefill_index_[model_id];
-    while (instance_model_states_[prefill_index_[now_prefill_index]][model_id] != ModelState::WAKEUP) {
-      now_prefill_index = (now_prefill_index + 1) % prefill_index_.size();
-    }
-    routing->prefill_name = prefill_index_[now_prefill_index];
-    next_prefill_index_[model_id] = (now_prefill_index + 1) % prefill_index_.size();
-  }
-
-  if (decode_index_.empty()) {
-    return true;
-  }
-
-  {
-    std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-    int32_t now_decode_index = next_decode_index_[model_id];
-    while (instance_model_states_[decode_index_[now_decode_index]][model_id] != ModelState::WAKEUP) {
-      now_decode_index = (now_decode_index + 1) % decode_index_.size();
-    }
-    routing->decode_name = decode_index_[now_decode_index];
-    next_decode_index_[model_id] = (now_decode_index + 1) % decode_index_.size();
-  }
-
-  return true;
+  return it->second->get_next_instance_pair(routing);
 }
 
 // TODO: refactor later, currently return all decode instances
 std::vector<std::string> InstanceMgr::get_static_decode_list(
     const std::string& instance_name) {
+  // Logic needs to find which model this instance serves or just return all?
+  // Original code returned all DECODE instances.
+  // With ModelInstanceMgr, we might need to query specific mgr?
+  // But this method takes instance_name... unused?
+  // Wait, argument is `instance_name` but not used in search?
+  // "currently return all decode instances"
+  
+  // For now, let's keep it global if possible, OR we need to know the model context.
+  // The caller likely wants peers.
+  
   std::vector<std::string> decode_list;
   std::shared_lock<std::shared_mutex> lock(inst_mutex_);
   for (auto& inst : instances_) {
@@ -214,7 +194,6 @@ std::vector<std::string> InstanceMgr::get_static_decode_list(
       decode_list.emplace_back(inst.second.name);
     }
   }
-
   return decode_list;
 }
 
@@ -229,7 +208,6 @@ std::vector<std::string> InstanceMgr::get_static_prefill_list(
       prefill_list.emplace_back(inst.second.name);
     }
   }
-
   return prefill_list;
 }
 
@@ -266,8 +244,9 @@ void InstanceMgr::fork_master_and_sleep(
     sleep_body["master_status"] = 1;
 
     if (send_http_request(channel, "/sleep", sleep_body.dump())) {
-      std::unique_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-      instance_model_states_[instance_name][model.first] = ModelState::SLEEP;  // Sleep
+      // update state in ModelInstanceMgr
+      auto mgr = get_model_instance_mgr(model.first);
+      mgr->set_model_state(instance_name, ModelState::SLEEP);
       LOG(INFO) << "Model " << model.first << " on " << instance_name
                 << " is now SLEEPING";
     } else {
@@ -444,12 +423,6 @@ void InstanceMgr::register_instance(const std::string& instance_name,
     LOG(ERROR) << "create channel fail: " << instance_name;
     return;
   }
-
-  {
-    std::unique_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-    instance_model_states_.emplace(instance_name,
-                                   std::unordered_map<std::string, ModelState>());
-  }
   
   // Note: we can't call fork_master_and_sleep here if we are holding
   // inst_mutex_ and fork_master_and_sleep calls send_http_request which calls
@@ -478,42 +451,29 @@ void InstanceMgr::register_instance(const std::string& instance_name,
     }
   }
 
-  switch (metainfo.type) {
-    case InstanceType::DEFAULT:
-    case InstanceType::PREFILL:
-      metainfo.instance_index = prefill_index_.size();
-      prefill_index_.emplace_back(instance_name);
-      LOG(INFO) << "Register a new prefill instance, instance name : "
-                << instance_name;
-      break;
-    case InstanceType::DECODE:
-      metainfo.instance_index = decode_index_.size();
-      decode_index_.emplace_back(instance_name);
-      LOG(INFO) << "Register a new decode instance, instance name : "
-                << instance_name;
-      break;
-    case InstanceType::MIX:
-      // In the initial state, we set the first MIX type instance as a
-      // decode instance, while all subsequent instances are set as
-      // prefill instances.
-      if (decode_index_.size() > 0) {
-        metainfo.instance_index = prefill_index_.size();
-        metainfo.current_type = InstanceType::PREFILL;
-        prefill_index_.emplace_back(instance_name);
-        LOG(INFO) << "Register a new prefill instance, instance name : "
-                  << instance_name;
-      } else {
-        metainfo.instance_index = decode_index_.size();
-        metainfo.current_type = InstanceType::DECODE;
-        decode_index_.emplace_back(instance_name);
-        LOG(INFO) << "Register a new decode instance, instance name : "
-                  << instance_name;
+  // Register with ModelInstanceMgrs
+  {
+    std::unique_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+    for (const auto& model_pair : MODELS) {
+      std::string model_id = model_pair.first;
+      if (model_instance_mgrs_.find(model_id) == model_instance_mgrs_.end()) {
+          model_instance_mgrs_[model_id] = std::make_shared<ModelInstanceMgr>(model_id);
       }
-      break;
-    default:
-      LOG(WARNING) << "Unknown InstanceType: " << int(metainfo.type);
-      break;
+      model_instance_mgrs_[model_id]->add_instance(instance_name, metainfo);
+    }
   }
+
+  // Legacy code cleanup / adaptation
+  // Note: original code updated indices here. ModelInstanceMgr does it internally.
+  // We still need to respect InstanceType logging if needed.
+  
+  /*
+  switch (metainfo.type) {
+    // ...
+  }
+  */
+  // Since we moved logic to ModelInstanceMgr, we might just log here.
+  LOG(INFO) << "Registered instance " << instance_name << " type " << (int)metainfo.type;
 
   instances_.insert(std::make_pair(instance_name, std::move(metainfo)));
 }
@@ -636,50 +596,12 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
           continue;
         }
         // TODO: notify cache manager to clear expire cache
-        uint64_t index = instances_[iter].instance_index;
-
-        switch (instances_[iter].type) {
-          case InstanceType::DEFAULT:
-          case InstanceType::PREFILL:
-            if (index == -1 || index >= prefill_index_.size()) {
-              break;
-            }
-            std::swap(prefill_index_[index], prefill_index_.back());
-            instances_[prefill_index_[index]].instance_index = index;
-            prefill_index_.pop_back();
-            break;
-          case InstanceType::DECODE:
-            if (index == -1 || index >= decode_index_.size()) {
-              break;
-            }
-            std::swap(decode_index_[index], decode_index_.back());
-            instances_[decode_index_[index]].instance_index = index;
-            decode_index_.pop_back();
-            break;
-          case InstanceType::MIX:
-            if (index == -1) {
-              break;
-            }
-            if (instances_[iter].current_type == InstanceType::PREFILL) {
-              if (index >= prefill_index_.size()) {
-                break;
-              }
-              std::swap(prefill_index_[index], prefill_index_.back());
-              instances_[prefill_index_[index]].instance_index = index;
-              prefill_index_.pop_back();
-            } else {
-              if (index >= decode_index_.size()) {
-                break;
-              }
-              std::swap(decode_index_[index], decode_index_.back());
-              instances_[decode_index_[index]].instance_index = index;
-              decode_index_.pop_back();
-            }
-            break;
-          default:
-            LOG(WARNING) << "Unknown InstanceType: "
-                         << int(instances_[iter].type);
-            break;
+        // Remove from ModelInstanceMgrs
+        {
+          std::unique_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+          for (auto& pair : model_instance_mgrs_) {
+            pair.second->remove_instance(iter);
+          }
         }
 
         instances_.erase(iter);
@@ -691,10 +613,6 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
               request_metrics_mutex_);
           time_predictors_.erase(iter);
           request_metrics_.erase(iter);
-        }
-        {
-          std::unique_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-          instance_model_states_.erase(iter);
         }
         {
           std::lock_guard<std::mutex> lock(update_mutex_);
@@ -916,52 +834,32 @@ bool InstanceMgr::select_instance_pair_on_slo(
 }
 
 void InstanceMgr::flip_prefill_to_decode(std::string& instance_name) {
-  if (prefill_index_.size() <= 1) {
-    // Ensure there is at least one prefill instance.
-    return;
+  std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+  // Flip in all managers
+  for (auto& pair : model_instance_mgrs_) {
+    pair.second->flip_prefill_to_decode(instance_name);
   }
-
+  
   if (instances_.find(instance_name) == instances_.end()) {
     LOG(ERROR) << "Can't find instance, instance_name: " << instance_name;
     return;
   }
-
-  // delete instance name from prefill_index_
-  uint64_t index = instances_[instance_name].instance_index;
-  std::swap(prefill_index_[index], prefill_index_.back());
-  instances_[prefill_index_[index]].instance_index = index;
-  prefill_index_.pop_back();
-
-  // insert instance name to decode_index_
-  instances_[instance_name].instance_index = decode_index_.size();
   instances_[instance_name].current_type = InstanceType::DECODE;
-  decode_index_.emplace_back(instance_name);
-
   LOG(INFO) << "Flip prefill to decode, instance name : " << instance_name;
 }
 
 void InstanceMgr::flip_decode_to_prefill(std::string& instance_name) {
-  if (decode_index_.size() <= 1) {
-    // Ensure there is at least one decode instance.
-    return;
+  std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+  // Flip in all managers
+  for (auto& pair : model_instance_mgrs_) {
+    pair.second->flip_decode_to_prefill(instance_name);
   }
-
+  
   if (instances_.find(instance_name) == instances_.end()) {
     LOG(ERROR) << "Can't find instance, instance_name: " << instance_name;
     return;
   }
-
-  // delete instance name from decode_index_
-  uint64_t index = instances_[instance_name].instance_index;
-  std::swap(decode_index_[index], decode_index_.back());
-  instances_[decode_index_[index]].instance_index = index;
-  decode_index_.pop_back();
-
-  // insert instance name to prefill_index
-  instances_[instance_name].instance_index = prefill_index_.size();
   instances_[instance_name].current_type = InstanceType::PREFILL;
-  prefill_index_.emplace_back(instance_name);
-
   LOG(INFO) << "Flip decode to prefill, instance name : " << instance_name;
 }
 
@@ -979,100 +877,46 @@ TimePredictor& InstanceMgr::get_time_predictor(
 
 void InstanceMgr::send_model_sleep(const std::string& instance_name,
                                    const std::string& model_id) {
-
   if (instance_name.empty() || instance_name == "all") {
     LOG(ERROR) << "Only support fixed instance_name for model trigger now.";
     return;
   }
 
-  // Use unique mutex for (instance_name, model_id) to serialize operations
-  std::mutex* op_mutex = get_op_mutex(instance_name, model_id);
-  std::lock_guard<std::mutex> lock(*op_mutex);
+  auto model_mgr = get_model_instance_mgr(model_id);
+  
+  std::shared_ptr<brpc::Channel> channel = get_channel(instance_name);
 
-  {
-    std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-    if (instance_model_states_[instance_name].count(model_id) &&
-        instance_model_states_[instance_name][model_id] == ModelState::SLEEP) {
-      LOG(INFO) << "Model " << model_id << " on " << instance_name
-                << " is already sleeping.";
-      return;  // Already sleep
-    }
-  }
-
-  nlohmann::json sleep_body;
-  sleep_body["model_id"] = model_id;
-  sleep_body["master_status"] = 1;
-
-  if (send_http_request(instance_name, "/sleep", sleep_body.dump())) {
-    LOG(INFO) << "Model " << model_id << " on " << instance_name
-              << " trigger sleep success.";
-    std::unique_lock<std::shared_mutex> model_state_lock(instance_model_state_mutex_);
-    std::unique_lock<std::shared_mutex> model_count_lock(model_count_mutex_);
+  if (model_mgr->send_model_sleep(instance_name, channel)) {
+    // trigger sleep success, decrease memory usage
     std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
-    
-    if (instance_model_states_[instance_name][model_id] == ModelState::WAKEUP) {
-      // Only decrease model count if the model is not DRAINING
-      model_waking_up_counts_[model_id] -= 1;
-      model_count_[model_id] -= 1;
-    }
-    
-    instance_model_states_[instance_name][model_id] = ModelState::SLEEP;  // Sleep
     instance_memory_usage_[instance_name] -= get_model_memory_size(model_id);
-
     if (instance_memory_usage_[instance_name] < 0) {
       LOG(WARNING) << "Instance " << instance_name
                    << " memory usage negative, reset to 0.";
       instance_memory_usage_[instance_name] = 0;
     }
-
-  } else {
-    LOG(ERROR) << "Failed to sleep model " << model_id << " on "
-               << instance_name;
+    
   }
 }
 
 void InstanceMgr::send_model_wakeup(const std::string& instance_name,
                                     const std::string& model_id,
-                                    bool memory_increased_in_advance) {// memory_increased_in_advance: for race conditions
+                                    bool memory_increased_in_advance) {
 
   if (instance_name.empty() || instance_name == "all") {
     LOG(ERROR) << "Only support fixed instance_name for model trigger now.";
     return;
   }
 
-  // Use unique mutex for (instance_name, model_id) to serialize operations
-  std::mutex* op_mutex = get_op_mutex(instance_name, model_id);
-  std::lock_guard<std::mutex> lock(*op_mutex);
+  auto model_mgr = get_model_instance_mgr(model_id);
 
-  {
-    std::unique_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-    if (instance_model_states_[instance_name].count(model_id) &&
-        (instance_model_states_[instance_name][model_id] == ModelState::WAKEUP ||
-         instance_model_states_[instance_name][model_id] == ModelState::SENDING_WAKEUP_REQUEST)) {
-      LOG(INFO) << "Model " << model_id << " on " << instance_name
-                << " is already wakeup or sending wakeup request.";
-      return;  // Already wakeup
-    }
-    instance_model_states_[instance_name][model_id] = ModelState::SENDING_WAKEUP_REQUEST;
-  }
+  std::shared_ptr<brpc::Channel> channel = get_channel(instance_name);
 
-  nlohmann::json wakeup_body;
-  wakeup_body["model_id"] = model_id;
-  wakeup_body["master_status"] = 0;
-
-  if (send_http_request(instance_name, "/wakeup", wakeup_body.dump())) {
-    LOG(INFO) << "Model " << model_id << " on " << instance_name
-              << " trigger wakeup success.";
-    std::unique_lock<std::shared_mutex> inst_lock(instance_model_state_mutex_);
-    std::unique_lock<std::shared_mutex> model_count_lock(model_count_mutex_);
-    instance_model_states_[instance_name][model_id] = ModelState::WAKEUP;  // Wakeup
-    model_count_[model_id] += 1;
-
+  if (model_mgr->send_model_wakeup(instance_name, channel)) {
     if (!memory_increased_in_advance) {
       std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
       instance_memory_usage_[instance_name] += get_model_memory_size(model_id);
     }
-
     if (instance_memory_usage_[instance_name] > kMaxInstanceMemoryGB) {
       LOG(WARNING) << "Instance " << instance_name
                    << " memory usage exceeds max limit after waking up model "
@@ -1081,11 +925,6 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
   } else {
     LOG(ERROR) << "Failed to wakeup model " << model_id
                << " on " << instance_name;
-    {
-      // Wakeup failed, revert status to SLEEP or handle accordingly
-      std::unique_lock<std::shared_mutex> inst_lock(instance_model_state_mutex_);
-      instance_model_states_[instance_name][model_id] = ModelState::SLEEP;
-    }
     if (memory_increased_in_advance) {
       std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
       instance_memory_usage_[instance_name] -= get_model_memory_size(model_id);
@@ -1123,71 +962,24 @@ double InstanceMgr::get_model_memory_size(const std::string& model_id) {
 }
 
 bool InstanceMgr::is_model_waking_up(const std::string& model_id) {
-  std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-  for (auto& pair : instance_model_states_) {
-    auto it = pair.second.find(model_id);
-    if (it != pair.second.end() &&
-        (it->second == ModelState::WAKING_UP ||
-         it->second == ModelState::SENDING_WAKEUP_REQUEST ||
-         it->second == ModelState::WAKEUP)) {
-      return true;
-    }
-  }
-  return false;
+  auto model_mgr = get_model_instance_mgr(model_id);
+  return model_mgr->is_model_waking_up();
 }
 
 std::vector<std::string> InstanceMgr::get_awake_instances(const std::string& model_id) {
-  std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-  std::vector<std::string> awake_instances;
-  for (const auto& instance_pair : instance_model_states_) {
-    const std::string& instance_name = instance_pair.first;
-    const auto& model_states = instance_pair.second;
-    
-    if (model_states.count(model_id) && model_states.at(model_id) == ModelState::WAKEUP) {
-      awake_instances.push_back(instance_name);
-    }
-  }
-  return awake_instances;
+  auto model_mgr = get_model_instance_mgr(model_id);
+  return model_mgr->get_awake_instances();
 }
 
-int32_t InstanceMgr::get_model_count(const std::string& model_id) {
-  std::shared_lock<std::shared_mutex> lock(model_count_mutex_);
-  return model_count_[model_id];
+void InstanceMgr::update_model_heat(const std::string& model_id,
+                                    int64_t token_count) {
+  auto model_mgr = get_model_instance_mgr(model_id);
+  model_mgr->update_model_heat(token_count);
 }
 
-std::string InstanceMgr::wait_for_model_wakeup(const std::string& model_id,
-                                               std::chrono::milliseconds timeout_ms) {
-  std::unique_lock<std::mutex> lock(wakeup_mutex_);
-  bool not_timeout = wakeup_cv_.wait_for(lock, timeout_ms, [this, model_id]() {
-    return !is_model_waking_up(model_id);
-  });
-  if (!not_timeout) {
-    return ""; // Timeout, return empty instance_name
-  }
-  std::string instance_name;
-  auto it = wakeup_instance_name_.find(model_id);
-  if (it != wakeup_instance_name_.end()) {
-    return it->second;
-  }
-  return "";
-}
-
-void InstanceMgr::notify_model_wakeup(const std::string& model_id,
-                                      const std::string& instance_name) {
-  // Just notify all waiting threads to re-check
-  {
-    std::lock_guard<std::mutex> lock(wakeup_mutex_);
-    // if instance_name == "", this means the allocation thread fails to get awake instances
-    wakeup_instance_name_[model_id] = instance_name;
-  }
-  wakeup_cv_.notify_all();
-}
-
-void InstanceMgr::update_model_heat(const std::string& model_id, int64_t token_count) {
-  std::lock_guard<std::mutex> lock(model_heat_mutex_);
-  prune_model_heat_locked(model_id);
-  model_heat_records_[model_id].push_back({std::chrono::steady_clock::now(), token_count});
-  global_model_heat_[model_id] += token_count;
+int32_t InstanceMgr::get_wakeup_count(const std::string& model_id) {
+  auto model_mgr = get_model_instance_mgr(model_id);
+  return model_mgr->get_wakeup_count();
 }
 
 // returns the instance_names of newly allocated(already wakeup or is waking_up) models
@@ -1200,8 +992,8 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
   int model_count_margin = 0;
   {
     std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
-    std::shared_lock<std::shared_mutex> model_state_lock(instance_model_state_mutex_);
-    model_count_margin = target_model_count - model_waking_up_counts_[model_id];
+    auto model_mgr = get_model_instance_mgr(model_id);
+    model_count_margin = target_model_count - model_mgr->get_allocation_count();
     if (model_count_margin <= 0) {
       LOG(INFO) << "Model " << model_id << " is already being allocated to target count "
                 << target_model_count << ". Give up allocation.";
@@ -1224,17 +1016,15 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
     std::unique_lock<std::mutex> mem_lock(instance_memory_mutex_);
     for (const auto& pair : instance_memory_usage_) {
       const std::string& instance_name = pair.first;
-
-      {
-        std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-        if (instance_model_states_[instance_name][model_id] != ModelState::SLEEP) {
-          // Model not ready to wake up.
-          // Note that DRAINING does not contribute to model_waking_up_counts,
-          // but expecting DRAINING->SLEEP->WAKEUP_AGAIN yields too much race conditions.
-          // We would rather expect a temporary -1 margin on model_waking_up_counts,
-          // which is to be fixed by triggering allocate_instance_for_model again during the next auto_scaling.
-          continue;
-        }
+      auto model_mgr = get_model_instance_mgr(model_id);
+      
+      if (model_mgr->get_model_state(instance_name) != ModelState::SLEEP) {
+        // Model not ready to wake up.
+        // Note that DRAINING does not contribute to model_waking_up_counts,
+        // but expecting DRAINING->SLEEP->WAKEUP_AGAIN yields too much race conditions.
+        // We would rather expect a temporary -1 margin on model_waking_up_counts,
+        // which is to be fixed by triggering allocate_instance_for_model again during the next auto_scaling.
+        continue;
       }
 
       double current_usage = pair.second;
@@ -1243,10 +1033,8 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
                 << " current memory usage: " << current_usage << " GB.";
 
       if (current_usage + model_size <= kMaxInstanceMemoryGB) {
-        std::unique_lock<std::shared_mutex> model_state_lock(instance_model_state_mutex_);
         instance_memory_usage_[instance_name] += model_size;
-        instance_model_states_[instance_name][model_id] = ModelState::WAKING_UP;
-        model_waking_up_counts_[model_id] += 1;
+        model_mgr->set_model_state(instance_name, ModelState::ALLOCATED);
 
         wakeup_threads.emplace_back([this, instance_name, model_id]() {
           send_model_wakeup(instance_name, model_id, /*memory_increased_in_advance*/ true);
@@ -1268,14 +1056,12 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
     std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_); // Iterate instances safely
     for (const auto& inst_pair : instances_) {
       std::string instance_name = inst_pair.first;
+      auto model_mgr = get_model_instance_mgr(model_id);
 
-      {
-        std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-        if (instance_model_states_[instance_name][model_id] != ModelState::SLEEP) {
-          // Model not ready.
-          // This double check is for race conditions. (After allocation_lock, are there race conditions?)
-          continue;
-        }
+      if (model_mgr->get_model_state(instance_name) != ModelState::SLEEP) {
+        // Model not ready.
+        // This double check is for race conditions. (After allocation_lock, are there race conditions?)
+        continue;
       }
       
       // Check current usage
@@ -1318,17 +1104,15 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
     newly_allocated_instances.push_back(instance_name);
 
     {
-      std::unique_lock<std::shared_mutex> model_state_lock(instance_model_state_mutex_);
-      std::unique_lock<std::shared_mutex> count_lock(model_count_mutex_);
+      auto model_mgr = get_model_instance_mgr(model_id);
       
-      // early mark as WAKING_UP, for race conditions 
+      // early mark as ALLOCATED, for race conditions
       // (multiple entrance in allocate_instance_for_model)
-      instance_model_states_[instance_name][model_id] = ModelState::WAKING_UP;
-      model_waking_up_counts_[model_id] += 1;
+      model_mgr->set_model_state(instance_name, ModelState::ALLOCATED);
+
       for (const auto& model_to_evict : current_plan.models_to_evict) {
-        instance_model_states_[instance_name][model_to_evict] = ModelState::DRAINING;
-        model_waking_up_counts_[model_to_evict] -= 1;
-        model_count_[model_to_evict] -= 1;
+        auto evict_mgr = get_model_instance_mgr(model_to_evict);
+        evict_mgr->set_model_state(instance_name, ModelState::DRAINING);
       }
     }
 
@@ -1401,41 +1185,39 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
 
 // Select models to evict out >= required_space, meanwhile minimizing sum(heat)
 EvictionPlanInfo InstanceMgr::select_eviction_candidates(const std::string& instance_name, 
-                                                                 double required_space) {
-    
+                                                         double required_space) {    
+
   // Get all awake models on this instance
   std::vector<std::string> awake_models;
-  {
-    std::shared_lock<std::shared_mutex> model_state_lock(instance_model_state_mutex_);
-    std::shared_lock<std::shared_mutex> model_count_lock(model_count_mutex_);
-    if (instance_model_states_.count(instance_name)) {
-      for (const auto& pair : instance_model_states_.at(instance_name)) {
-        if (pair.second == ModelState::WAKEUP &&
-            model_count_[pair.first] > 1) {
-          awake_models.push_back(pair.first);
-        }
-        if (pair.second == ModelState::WAKEUP &&
-            model_count_[pair.first] == 1) {
-          std::lock_guard<std::mutex> lock(model_heat_mutex_);
-          prune_model_heat_locked(pair.first);
-          if (global_model_heat_[pair.first] == 0) {
-            awake_models.push_back(pair.first);
-          }
+  
+  // Iterate all models to check status on this instance
+  std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+  for (const auto& pair : model_instance_mgrs_) {
+    const std::string& model_id = pair.first;
+    auto model_mgr = pair.second;
+    
+    ModelState state = model_mgr->get_model_state(instance_name);
+    
+    if (state == ModelState::WAKEUP) {
+      if (model_mgr->get_wakeup_count() > 1) {
+        awake_models.push_back(model_id);
+      } else if (model_mgr->get_wakeup_count() == 1) {
+        // if this is the only instance for this model, only evict if heat is 0
+        if (model_mgr->get_model_heat() == 0) {
+          awake_models.push_back(model_id);
         }
       }
     }
   }
 
-  // Select models to evict enough space for the new model, meanwhile minimizing sum(heat)
+  // take snapshot of the current model heats
   std::vector<uint64_t> awake_model_heats;
-  {
-    std::lock_guard<std::mutex> lock(model_heat_mutex_);
-    for (const auto& model_id : awake_models) {
-      prune_model_heat_locked(model_id);
-      awake_model_heats.push_back(global_model_heat_[model_id]);
-    }
+  for (const auto& model_id : awake_models) {
+    auto model_mgr = get_model_instance_mgr(model_id);
+    awake_model_heats.push_back(model_mgr->get_model_heat());
   }
 
+  // Select models to evict enough space for the new model, meanwhile minimizing sum(heat)
   uint64_t min_sum_heat = std::numeric_limits<uint64_t>::max();
   size_t best_subset = 0;
   for (size_t subset = 0; subset < 1 << awake_models.size(); ++subset) {
@@ -1469,16 +1251,6 @@ EvictionPlanInfo InstanceMgr::select_eviction_candidates(const std::string& inst
 
   return best_plan;
 }
-  
-std::mutex* InstanceMgr::get_op_mutex(const std::string& instance_name,
-                                      const std::string& model_id) {  
-  std::string key = instance_name + ":" + model_id;
-  std::lock_guard<std::mutex> lock(op_mutex_map_mutex_);
-  if (op_mutexes_.find(key) == op_mutexes_.end()) {
-    op_mutexes_[key] = std::make_unique<std::mutex>();
-  }
-  return op_mutexes_[key].get();
-}
 
 void InstanceMgr::auto_scaling() {
   const int hottest_model_target_count = 4;
@@ -1492,19 +1264,19 @@ void InstanceMgr::auto_scaling() {
   int64_t second_max_heat = 0;
   
   {
-    std::lock_guard<std::mutex> lock(model_heat_mutex_);
-    for (const auto& pair : global_model_heat_) {
-      prune_model_heat_locked(pair.first);
-      if (pair.second > max_heat) {
+    std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+    for (const auto& pair : model_instance_mgrs_) {
+      int64_t current_heat = pair.second->get_model_heat();
+      if (current_heat > max_heat) {
 
         second_max_heat = max_heat;
         second_hottest_model = hottest_model;
 
-        max_heat = pair.second;
+        max_heat = current_heat;
         hottest_model = pair.first;
 
-      } else if (pair.second > second_max_heat) {
-        second_max_heat = pair.second;
+      } else if (current_heat > second_max_heat) {
+        second_max_heat = current_heat;
         second_hottest_model = pair.first;
       }
     }
@@ -1516,28 +1288,18 @@ void InstanceMgr::auto_scaling() {
   
   LOG(INFO) << "Current model heats:";
   {
-    std::lock_guard<std::mutex> lock(model_heat_mutex_);
-    for (const auto& pair : global_model_heat_) {
-      LOG(INFO) << "Model " << pair.first << ": Heat = " << pair.second;
+    std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+    for (const auto& pair : model_instance_mgrs_) {
+      LOG(INFO) << "Model " << pair.first << ": Heat = " << pair.second->get_model_heat();
     }
   }
 
   LOG(INFO) << "Hottest model: " << (hottest_model.empty() ? "None" : hottest_model) << " with heat: " << max_heat;
   LOG(INFO) << "Second hottest model: " << second_hottest_model << " with heat: " << second_max_heat;
 
-  bool hottest_model_needs_scale_up = true;
-  int hottest_model_count_margin = 0;
-
-  {
-    std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-    hottest_model_count_margin = hottest_model_target_count - model_waking_up_counts_[hottest_model];
-    if (model_waking_up_counts_[hottest_model] >= hottest_model_target_count) {
-      LOG(INFO) << "No need to scale up, hottest model " << hottest_model << " already has " << hottest_model_target_count << " instances.";
-      hottest_model_needs_scale_up = false;
-    }
-  }
-
-  if (hottest_model_needs_scale_up) {
+  auto model_mgr = get_model_instance_mgr(hottest_model);
+  int hottest_model_count_margin = hottest_model_target_count - model_mgr->get_allocation_count();
+  if (hottest_model_count_margin > 0) {
     auto instance_names = allocate_instance_for_model(hottest_model, /*target_model_count*/ hottest_model_target_count);
 
     if (instance_names.empty()) {
@@ -1550,25 +1312,17 @@ void InstanceMgr::auto_scaling() {
         LOG(INFO) << instance_name;
       }
     }
+  } else {
+    LOG(INFO) << "No need to scale up, hottest model " << hottest_model << " already has " << hottest_model_target_count << " instances.";
   }
 
   if (second_hottest_model.empty()) {
     return;
   }
 
-  bool second_hottest_model_needs_scale_up = true;
-  int second_hottest_model_count_margin = 0;
-
-  {
-    std::shared_lock<std::shared_mutex> lock(instance_model_state_mutex_);
-    second_hottest_model_count_margin = second_hottest_model_target_count - model_waking_up_counts_[second_hottest_model];
-    if (model_waking_up_counts_[second_hottest_model] >= second_hottest_model_target_count) {
-      LOG(INFO) << "No need to scale up, second hottest model " << second_hottest_model << " already has " << second_hottest_model_target_count << " instances.";
-      second_hottest_model_needs_scale_up = false;
-    }
-  }
-
-  if (second_hottest_model_needs_scale_up) {
+  model_mgr = get_model_instance_mgr(second_hottest_model);
+  int second_hottest_model_count_margin = second_hottest_model_target_count - model_mgr->get_allocation_count();
+  if (second_hottest_model_count_margin > 0) {
     auto instance_names = allocate_instance_for_model(second_hottest_model, /*target_model_count*/ second_hottest_model_target_count);
 
     if (instance_names.empty()) {
@@ -1581,24 +1335,18 @@ void InstanceMgr::auto_scaling() {
         LOG(INFO) << instance_name;
       }
     }
+  } else {
+    LOG(INFO) << "No need to scale up, second hottest model " << second_hottest_model << " already has " << second_hottest_model_target_count << " instances.";
   }
 }
 
-void InstanceMgr::prune_model_heat_locked(const std::string& model_id) {
-  auto& records = model_heat_records_[model_id];
-  auto now = std::chrono::steady_clock::now();
-  while (!records.empty()) {
-    auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - records.front().timestamp).count();
-    if (duration > 5) {
-      global_model_heat_[model_id] -= records.front().token_count;
-      records.pop_front();
-    } else {
-      break;
-    }
+ModelInstanceMgr* InstanceMgr::get_model_instance_mgr(const std::string& model_id) {
+  std::shared_lock<std::shared_mutex> lock(model_instance_mgr_mutex_);
+  if (model_instance_mgrs_.count(model_id)) {
+    return model_instance_mgrs_[model_id].get();
   }
-  if (global_model_heat_[model_id] < 0) {
-    global_model_heat_[model_id] = 0;
-  }
+  LOG(ERROR) << "Model instance manager not found for model " << model_id;
+  return nullptr;
 }
 
 }  // namespace xllm_service
