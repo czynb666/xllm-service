@@ -24,6 +24,7 @@ limitations under the License.
 #include <thread>
 
 static constexpr int kHeartbeatInterval = 3;  // in seconds
+static constexpr int kQueueProcessThreadNum = 4;
 static std::string ETCD_MASTER_SERVICE_KEY = "XLLM:SERVICE:MASTER";
 
 namespace xllm_service {
@@ -75,8 +76,10 @@ Scheduler::~Scheduler() {
     queue_pair.second->emplace(nullptr);  // unblock queue
   }
   for (auto& thread_pair : processing_threads_) {
-    if (thread_pair.second->joinable()) {
-      thread_pair.second->join();
+    for (auto& thread : thread_pair.second) {
+      if (thread->joinable()) {
+        thread->join();
+      }
     }
   }
   etcd_client_->stop_watch();
@@ -117,8 +120,12 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
     if (request_queues_.find(request->model) == request_queues_.end()) {
       request_queues_[request->model] =
           std::make_shared<ConcurrentQueue<std::shared_ptr<Request>>>();
-      processing_threads_[request->model] = std::make_unique<std::thread>(
-          &Scheduler::process_request_queue, this, request->model);
+      for (int i = 0; i < kQueueProcessThreadNum; ++i) {
+        processing_threads_[request->model].emplace_back(
+            std::make_unique<std::thread>(&Scheduler::process_request_queue,
+                                          this,
+                                          request->model));
+      }
     }
     request_queues_[request->model]->push(request);
   }
@@ -143,7 +150,7 @@ void Scheduler::process_request_queue(const std::string& model_name) {
     }
 
     // Check if model is already awake on any instance
-    int32_t model_count = instance_mgr_->get_model_count(request->model);
+    int32_t model_count = instance_mgr_->get_wakeup_count(request->model);
 
     if (model_count > 0) {
       lb_policy_->select_instances_pair(request);

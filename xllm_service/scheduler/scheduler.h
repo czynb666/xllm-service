@@ -119,7 +119,7 @@ class Scheduler final {
   std::mutex queue_mutex_;
 
   // `model name` -> `processing thread` map
-  std::unordered_map<std::string, std::unique_ptr<std::thread>>
+  std::unordered_map<std::string, std::vector<std::unique_ptr<std::thread>>>
       processing_threads_;
 
 

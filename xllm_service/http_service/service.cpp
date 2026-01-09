@@ -175,83 +175,76 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
     }
   }
 
-  // async redistribute the request and wait the response
-  // thread_pool_->schedule([this,
-  //                         request,
-  //                         req_attachment = std::move(req_attachment),
-  //                         call_data,
-  //                         channel_ptr,
-  //                         target_uri = target_uri + method]() {
-  {
-    auto& target_uri = request->routing.prefill_name;
-    brpc::Channel* channel_ptr = scheduler_->get_channel(target_uri).get();
+  // sync redistribute the request and wait the response.
+  // because this handle is aysnc called in dispatch_callback.
+  auto& target_uri = request->routing.prefill_name;
+  brpc::Channel* channel_ptr = scheduler_->get_channel(target_uri).get();
 
-    brpc::Controller* redirect_cntl = new brpc::Controller();
-    redirect_cntl->http_request().uri() = (target_uri + method).c_str();
-    redirect_cntl->http_request().set_method(brpc::HTTP_METHOD_POST);
+  brpc::Controller* redirect_cntl = new brpc::Controller();
+  redirect_cntl->http_request().uri() = (target_uri + method).c_str();
+  redirect_cntl->http_request().set_method(brpc::HTTP_METHOD_POST);
 
-    // redirect the input request content
-    redirect_cntl->request_attachment().append(req_attachment);
+  // redirect the input request content
+  redirect_cntl->request_attachment().append(req_attachment);
 
-    // 1. tokens will be received via rpc channel.
-    //
-    if (enable_decode_response_to_service_) {
-      auto instance_info =
-          scheduler_->get_instance_info(request->routing.prefill_name);
-      google::protobuf::Closure* done =
-          brpc::NewCallback(&handle_first_response<T>,
-                            redirect_cntl,
-                            call_data,
-                            scheduler_,
-                            request->service_request_id,
-                            request->stream,
-                            instance_info.enable_disagg_pd);
-      channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
-      if (redirect_cntl->Failed()) {
-        LOG(ERROR) << "Redirect to instance error: "
-                   << redirect_cntl->ErrorText();
-        call_data->finish_with_error(redirect_cntl->ErrorText());
-        scheduler_->finish_request(request->service_request_id, /*error=*/true);
-        delete done;
-        delete redirect_cntl;
-        return;
-      }
+  // 1. tokens will be received via rpc channel.
+  //
+  if (enable_decode_response_to_service_) {
+    auto instance_info =
+        scheduler_->get_instance_info(request->routing.prefill_name);
+    google::protobuf::Closure* done =
+        brpc::NewCallback(&handle_first_response<T>,
+                          redirect_cntl,
+                          call_data,
+                          scheduler_,
+                          request->service_request_id,
+                          request->stream,
+                          instance_info.enable_disagg_pd);
+    channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
+    if (redirect_cntl->Failed()) {
+      LOG(ERROR) << "Redirect to instance error: "
+                  << redirect_cntl->ErrorText();
+      call_data->finish_with_error(redirect_cntl->ErrorText());
+      scheduler_->finish_request(request->service_request_id, /*error=*/true);
+      delete done;
+      delete redirect_cntl;
       return;
     }
+    return;
+  }
 
-    // 2. tokens will be received via http channel.
-    //
-    if (request->stream) {
-      // receive tokens in progressive mode.
-      redirect_cntl->response_will_be_read_progressively();
+  // 2. tokens will be received via http channel.
+  //
+  if (request->stream) {
+    // receive tokens in progressive mode.
+    redirect_cntl->response_will_be_read_progressively();
 
-      // Because `done'(last parameter) is NULL, this function waits until
-      // the response comes back or error occurs(including timeout).
-      channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, NULL);
-      if (redirect_cntl->Failed()) {
-        LOG(ERROR) << "Redirect to instance error: "
-                   << redirect_cntl->ErrorText();
-        call_data->finish_with_error(redirect_cntl->ErrorText());
-        delete redirect_cntl;
-        return;
-      }
-      auto reader = new CustomProgressiveReader<T>(redirect_cntl, call_data);
-      // redirect_cntl and reader will be deleted in CustomProgressiveReader.
-      redirect_cntl->ReadProgressiveAttachmentBy(reader);
-    } else {
-      google::protobuf::Closure* done = brpc::NewCallback(
-          &handle_non_stream_response<T>, redirect_cntl, call_data);
-      channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
-      if (redirect_cntl->Failed()) {
-        LOG(ERROR) << "Redirect to instance error: "
-                   << redirect_cntl->ErrorText();
-        call_data->finish_with_error(redirect_cntl->ErrorText());
-        delete done;
-        delete redirect_cntl;
-        return;
-      }
+    // Because `done'(last parameter) is NULL, this function waits until
+    // the response comes back or error occurs(including timeout).
+    channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, NULL);
+    if (redirect_cntl->Failed()) {
+      LOG(ERROR) << "Redirect to instance error: "
+                  << redirect_cntl->ErrorText();
+      call_data->finish_with_error(redirect_cntl->ErrorText());
+      delete redirect_cntl;
+      return;
     }
-  };
+    auto reader = new CustomProgressiveReader<T>(redirect_cntl, call_data);
+    // redirect_cntl and reader will be deleted in CustomProgressiveReader.
+    redirect_cntl->ReadProgressiveAttachmentBy(reader);
+  } else {
+    google::protobuf::Closure* done = brpc::NewCallback(
+        &handle_non_stream_response<T>, redirect_cntl, call_data);
+    channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
+    if (redirect_cntl->Failed()) {
+      LOG(ERROR) << "Redirect to instance error: "
+                  << redirect_cntl->ErrorText();
+      call_data->finish_with_error(redirect_cntl->ErrorText());
+      delete done;
+      delete redirect_cntl;
+      return;
+    }
+  }
 }
 
 template <typename T>
@@ -590,6 +583,8 @@ void XllmHttpServiceImpl::ModelTriggers(
     LOG(INFO) << "Sending model wakeup request: " << trigger_type
               << " for model " << model_id << " on instance "
               << instance_name;
+    scheduler_->get_instance_mgr()->get_model_instance_mgr(model_id)->set_model_state(
+        instance_name, ModelState::ALLOCATED);
     scheduler_->get_instance_mgr()->send_model_wakeup(
         instance_name, model_id, /*memory_increased_in_advance*/ false);
   } else {

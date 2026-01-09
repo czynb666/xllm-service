@@ -1,0 +1,324 @@
+/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/jd-opensource/xllm-service/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "scheduler/managers/model_instance_mgr.h"
+#include <glog/logging.h>
+#include <algorithm>
+#include <brpc/controller.h>
+#include <nlohmann/json.hpp>
+
+namespace xllm_service {
+
+ModelInstanceMgr::ModelInstanceMgr(const std::string& model_id)
+    : model_id_(model_id) {}
+
+ModelInstanceMgr::~ModelInstanceMgr() {}
+
+void ModelInstanceMgr::add_instance(const std::string& instance_name, const InstanceMetaInfo& info) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  instances_[instance_name] = info;
+  
+  // Initially add to decode list, logic can be refined
+  prefill_index_.push_back(instance_name);
+  decode_index_.push_back(instance_name);
+}
+
+void ModelInstanceMgr::remove_instance(const std::string& instance_name) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  instances_.erase(instance_name);
+  
+  // Remove from indices
+  auto remove_from_vec = [&](std::vector<std::string>& vec) {
+    vec.erase(std::remove(vec.begin(), vec.end(), instance_name), vec.end());
+  };
+  remove_from_vec(prefill_index_);
+  remove_from_vec(decode_index_);
+}
+
+void ModelInstanceMgr::update_instance_info(const std::string& instance_name, const InstanceMetaInfo& info) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  if (instances_.find(instance_name) != instances_.end()) {
+    instances_[instance_name] = info;
+  }
+}
+
+bool ModelInstanceMgr::get_next_instance_pair(Routing* routing) {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  
+  if (prefill_index_.empty() || decode_index_.empty()) {
+    return false;
+  }
+  
+  std::shared_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
+  while (instance_states_[prefill_index_[next_prefill_index_]] != ModelState::WAKEUP) {
+    next_prefill_index_ = (next_prefill_index_ + 1) % prefill_index_.size();
+  }
+  while (instance_states_[decode_index_[next_decode_index_]] != ModelState::WAKEUP) {
+    next_decode_index_ = (next_decode_index_ + 1) % decode_index_.size();
+  }
+
+  routing->prefill_name = prefill_index_[next_prefill_index_];
+  routing->decode_name = decode_index_[next_decode_index_];
+
+  next_prefill_index_ = (next_prefill_index_ + 1) % prefill_index_.size();
+  next_decode_index_ = (next_decode_index_ + 1) % decode_index_.size();
+  
+  return true;
+}
+
+void ModelInstanceMgr::flip_prefill_to_decode(const std::string& instance_name) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  
+  auto it = std::find(prefill_index_.begin(), prefill_index_.end(), instance_name);
+  if (it != prefill_index_.end()) {
+    prefill_index_.erase(it);
+    decode_index_.push_back(instance_name);
+  }
+}
+
+void ModelInstanceMgr::flip_decode_to_prefill(const std::string& instance_name) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  
+  auto it = std::find(decode_index_.begin(), decode_index_.end(), instance_name);
+  if (it != decode_index_.end()) {
+    decode_index_.erase(it);
+    prefill_index_.push_back(instance_name);
+  }
+}
+
+std::vector<std::string> ModelInstanceMgr::get_prefill_list() const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  return prefill_index_;
+}
+
+std::vector<std::string> ModelInstanceMgr::get_decode_list() const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  return decode_index_;
+}
+
+bool ModelInstanceMgr::send_http_request(std::shared_ptr<brpc::Channel> channel,
+                                         const std::string& uri,
+                                         const std::string& request_body) {
+  brpc::Controller cntl;
+  cntl.http_request().uri() = uri;  // brpc channel already has host:port
+  cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
+  cntl.http_request().set_content_type("application/json");
+  cntl.request_attachment().append(request_body);
+
+  channel->CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+
+  if (cntl.Failed()) {
+    LOG(ERROR) << "HTTP request failed: " << cntl.ErrorText();
+    return false;
+  }
+  return true;
+}
+
+bool ModelInstanceMgr::send_model_sleep(const std::string& instance_name, std::shared_ptr<brpc::Channel> channel) {
+  std::shared_mutex* instance_state_single_mutex = get_instance_state_single_mutex(instance_name);
+  std::unique_lock<std::shared_mutex> single_lock(*instance_state_single_mutex);
+
+  if (instance_states_.count(instance_name) &&
+      instance_states_[instance_name] != ModelState::WAKEUP &&
+      instance_states_[instance_name] != ModelState::DRAINING) {
+    LOG(INFO) << "Model " << model_id_
+              << " on " << instance_name
+              << " is not suitable for sleep. ModelState : " << static_cast<int32_t>(instance_states_[instance_name]);
+    return false;
+  }
+
+  nlohmann::json sleep_body;
+  sleep_body["model_id"] = model_id_;
+  sleep_body["master_status"] = 1;
+
+  // TODO: add retries
+  if (send_http_request(channel, "/sleep", sleep_body.dump())) {
+    LOG(INFO) << "Model " << model_id_ << " on " << instance_name
+              << " trigger sleep success.";
+    set_model_state(instance_name, ModelState::SLEEP);
+    return true;
+  } else {
+    LOG(ERROR) << "Failed to sleep model " << model_id_ << " on "
+               << instance_name;
+    return false;
+  }
+
+  return false;
+}
+
+bool ModelInstanceMgr::send_model_wakeup(const std::string& instance_name, std::shared_ptr<brpc::Channel> channel) {
+  std::shared_mutex* instance_state_single_mutex = get_instance_state_single_mutex(instance_name);
+  std::unique_lock<std::shared_mutex> single_lock(*instance_state_single_mutex);
+
+  if (instance_states_.count(instance_name) &&
+      instance_states_[instance_name] != ModelState::ALLOCATED) {
+    LOG(INFO) << "Model " << model_id_
+              << " on " << instance_name
+              << " is not suitable for wakeup. ModelState : " << static_cast<int32_t>(instance_states_[instance_name]);
+    return false;
+  }
+
+  nlohmann::json wakeup_body;
+  wakeup_body["model_id"] = model_id_;
+  wakeup_body["master_status"] = 0;
+
+  // TODO: add retries
+  if (send_http_request(channel, "/wakeup", wakeup_body.dump())) {
+    LOG(INFO) << "Model " << model_id_ << " on " << instance_name
+              << " trigger wakeup success.";
+    set_model_state(instance_name, ModelState::WAKEUP);
+    return true;
+  } else {
+    LOG(ERROR) << "Failed to wakeup model " << model_id_
+               << " on " << instance_name;
+    set_model_state(instance_name, ModelState::SLEEP);// or revert to ALLOCATED?
+    return false;
+  }
+
+  return false;
+}
+
+bool ModelInstanceMgr::set_model_state(const std::string& instance_name, ModelState new_state) {
+  std::unique_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
+  
+  if (instance_states_.find(instance_name) == instance_states_.end()) {
+    instance_states_[instance_name] = ModelState::SLEEP;
+  }
+
+  ModelState current_state = instance_states_[instance_name];
+  
+  if (new_state == ModelState::WAKEUP) {
+    if (current_state == ModelState::ALLOCATED) {
+      instance_states_[instance_name] = ModelState::WAKEUP;
+      wakeup_count_ += 1;
+      return true;
+    } else {
+      LOG(ERROR) << "ModelInstanceMgr::set_model_state: invalid state transition to WAKEUP from " << static_cast<int32_t>(current_state);
+      return false;
+    }
+  } else if (new_state == ModelState::SLEEP) {
+    if (current_state == ModelState::DRAINING || current_state == ModelState::WAKEUP) {
+      instance_states_[instance_name] = ModelState::SLEEP;
+      if (current_state == ModelState::WAKEUP) {
+        wakeup_count_ -= 1;
+        allocation_count_ -= 1;
+      }
+      return true;
+    } else {
+      LOG(ERROR) << "ModelInstanceMgr::set_model_state: invalid state transition to SLEEP from " << static_cast<int32_t>(current_state);
+      return false;
+    }
+  } else if (new_state == ModelState::ALLOCATED) {
+    if (current_state == ModelState::SLEEP) {
+      instance_states_[instance_name] = ModelState::ALLOCATED;
+      allocation_count_ += 1;
+      return true;
+    } else {
+      LOG(ERROR) << "ModelInstanceMgr::set_model_state: invalid state transition to ALLOCATED from " << static_cast<int32_t>(current_state);
+      return false;
+    }
+  } else if (new_state == ModelState::DRAINING) {
+    if (current_state == ModelState::WAKEUP) {
+      instance_states_[instance_name] = ModelState::DRAINING;
+      wakeup_count_ -= 1;
+      allocation_count_ -= 1;
+      return true;
+    } else {
+      LOG(ERROR) << "ModelInstanceMgr::set_model_state: invalid state transition to DRAINING from " << static_cast<int32_t>(current_state);
+      return false;
+    }
+  } else {
+    LOG(ERROR) << "ModelInstanceMgr::set_model_state: unsupported state transition. new state: " << static_cast<int32_t>(new_state);
+    return false;
+  }
+
+  return false;
+}
+
+ModelState ModelInstanceMgr::get_model_state(const std::string& instance_name) {
+  std::shared_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
+  auto it = instance_states_.find(instance_name);
+  if (it == instance_states_.end()) {
+    return ModelState::SLEEP;
+  }
+  return it->second;
+}
+
+bool ModelInstanceMgr::is_model_waking_up() {
+  std::shared_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
+  return allocation_count_ > 0;
+}
+
+int32_t ModelInstanceMgr::get_wakeup_count() {
+  std::shared_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
+  return wakeup_count_;
+}
+
+int32_t ModelInstanceMgr::get_allocation_count() {
+  std::shared_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
+  return allocation_count_;
+}
+
+std::vector<std::string> ModelInstanceMgr::get_awake_instances() {
+  std::shared_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
+  std::vector<std::string> awake_instances;
+  for (const auto& pair : instance_states_) {
+    if (pair.second == ModelState::WAKEUP) {
+      awake_instances.push_back(pair.first);
+    }
+  }
+  return awake_instances;
+}
+
+void ModelInstanceMgr::update_model_heat(int64_t token_count) {
+  std::lock_guard<std::mutex> heat_lock(model_heat_mutex_);
+  prune_model_heat_locked();
+  model_heat_records_.push_back({std::chrono::steady_clock::now(), token_count});
+  model_heat_ += token_count;
+}
+
+int64_t ModelInstanceMgr::get_model_heat() {
+  std::lock_guard<std::mutex> heat_lock(model_heat_mutex_);
+  prune_model_heat_locked();
+  return model_heat_;
+}
+
+void ModelInstanceMgr::prune_model_heat_locked() {
+  auto& records = model_heat_records_;
+  auto now = std::chrono::steady_clock::now();
+  while (!records.empty()) {
+    auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - records.front().timestamp).count();
+    if (duration > kModelHeatRetentionSeconds) {
+      model_heat_ -= records.front().token_count;
+      records.pop_front();
+    } else {
+      break;
+    }
+  }
+  if (model_heat_ < 0) {
+    LOG(WARNING) << "ModelInstanceMgr::prune_model_heat_locked: model_heat_ < 0, reset to 0.";
+    model_heat_ = 0;
+  }
+}
+
+std::shared_mutex* ModelInstanceMgr::get_instance_state_single_mutex(const std::string& instance_name) {  
+  std::unique_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
+  if (instance_state_single_mutexes_.find(instance_name) == instance_state_single_mutexes_.end()) {
+    instance_state_single_mutexes_[instance_name] = std::make_unique<std::shared_mutex>();
+  }
+  return instance_state_single_mutexes_[instance_name].get();
+}
+
+}  // namespace xllm_service

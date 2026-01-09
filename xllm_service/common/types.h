@@ -80,6 +80,15 @@ enum class InstanceType : int8_t {
   MIX = 3,
 };
 
+// SLEEP -> ALLOCATED -> WAKEUP -> DRAINING (skippable) -> SLEEP
+enum class ModelState : int32_t {
+  WAKEUP = 0,
+  SLEEP = 1,
+  DRAINING = 2,
+  ALLOCATED = 3 // allocated, but not WAKEUP yet
+};
+
+
 struct LoadMetrics {
   LoadMetrics() : waiting_requests_num(0), gpu_cache_usage_perc(0) {};
   LoadMetrics(const uint64_t& waiting_reqs_num, const float& usage)
