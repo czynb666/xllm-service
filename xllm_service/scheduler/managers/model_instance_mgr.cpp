@@ -30,9 +30,15 @@ void ModelInstanceMgr::add_instance(const std::string& instance_name, const Inst
   std::unique_lock<std::shared_mutex> lock(mutex_);
   instances_[instance_name] = info;
   
-  // Initially add to decode list, logic can be refined
-  prefill_index_.push_back(instance_name);
-  decode_index_.push_back(instance_name);
+  if (info.type() == proto::InstanceType::PREFILL) {
+    prefill_index_.push_back(instance_name);
+  } else if (info.type() == proto::InstanceType::DECODE) {
+    decode_index_.push_back(instance_name);
+  } else {
+    // default/mix
+    prefill_index_.push_back(instance_name);
+    decode_index_.push_back(instance_name);
+  }
 }
 
 void ModelInstanceMgr::remove_instance(const std::string& instance_name) {
@@ -60,7 +66,10 @@ bool ModelInstanceMgr::get_next_instance_pair(Routing* routing) {
   if (prefill_index_.empty() || decode_index_.empty()) {
     return false;
   }
-  
+    
+  if (next_prefill_index_ >= prefill_index_.size()) next_prefill_index_ = 0;
+  if (next_decode_index_ >= decode_index_.size()) next_decode_index_ = 0;
+
   std::shared_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
   while (instance_states_[prefill_index_[next_prefill_index_]] != ModelState::WAKEUP) {
     next_prefill_index_ = (next_prefill_index_ + 1) % prefill_index_.size();
@@ -311,6 +320,78 @@ void ModelInstanceMgr::prune_model_heat_locked() {
     LOG(WARNING) << "ModelInstanceMgr::prune_model_heat_locked: model_heat_ < 0, reset to 0.";
     model_heat_ = 0;
   }
+}
+
+void ModelInstanceMgr::auto_scaling(const std::unordered_map<std::string, LatencyMetrics>& latency_metrics) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  std::shared_lock<std::shared_mutex> state_lock(instance_state_all_mutex_);
+
+  int prefill_count = prefill_index_.size();
+  int decode_count = decode_index_.size();
+
+  for (const auto& pair : instance_states_) {
+    if (pair.second != ModelState::WAKEUP) continue;
+    
+    std::string instance_name = pair.first;
+    if (instances_.find(instance_name) == instances_.end()) continue;
+    
+    const auto& info = instances_[instance_name];
+    if (info.type != InstanceType::MIX) continue;
+
+    auto it = latency_metrics.find(instance_name);
+    if (it == latency_metrics.end()) continue;
+    
+    auto model_it = it->second.model_metrics.find(model_id_);
+    if (model_it == it->second.model_metrics.end()) continue;
+    
+    const auto& metrics = model_it->second;
+    
+    bool is_prefill = std::find(prefill_index_.begin(), prefill_index_.end(), instance_name) != prefill_index_.end();
+    bool is_decode = std::find(decode_index_.begin(), decode_index_.end(), instance_name) != decode_index_.end();
+    
+    const double HIGH_TTFT_MS = 2000.0;
+    const double HIGH_TBT_MS = 100.0;
+    
+    if (metrics.recent_max_ttft > HIGH_TTFT_MS) {
+      if (is_decode && !is_prefill) {
+        auto d_it = std::find(decode_index_.begin(), decode_index_.end(), instance_name);
+        if (d_it != decode_index_.end()) {
+          decode_index_.erase(d_it);
+          prefill_index_.push_back(instance_name);
+          
+          LOG(INFO) << "Model " << model_id_ << " on " << instance_name 
+                    << ": High TTFT (" << metrics.recent_max_ttft 
+                    << "), flipping DECODE -> PREFILL. New counts: P=" 
+                    << prefill_index_.size() << ", D=" << decode_index_.size();
+                    
+          prefill_count++;
+          decode_count--;
+        }
+      }
+    } else if (metrics.recent_max_tbt > HIGH_TBT_MS) {
+      if (is_prefill && !is_decode) {
+        if (prefill_count > 1) {
+          auto p_it = std::find(prefill_index_.begin(), prefill_index_.end(), instance_name);
+          if (p_it != prefill_index_.end()) {
+            prefill_index_.erase(p_it);
+            decode_index_.push_back(instance_name);
+            
+            LOG(INFO) << "Model " << model_id_ << " on " << instance_name 
+                      << ": High TBT (" << metrics.recent_max_tbt 
+                      << "), flipping PREFILL -> DECODE. New counts: P=" 
+                      << prefill_index_.size() << ", D=" << decode_index_.size();
+
+            prefill_count--;
+            decode_count++;
+          }
+        }
+      }
+    }
+  }
+
+  // Safety check for indices
+  if (next_prefill_index_ >= prefill_index_.size()) next_prefill_index_ = 0;
+  if (next_decode_index_ >= decode_index_.size()) next_decode_index_ = 0;
 }
 
 std::shared_mutex* ModelInstanceMgr::get_instance_state_single_mutex(const std::string& instance_name) {  

@@ -833,13 +833,17 @@ bool InstanceMgr::select_instance_pair_on_slo(
   return true;
 }
 
+// flip all models
 void InstanceMgr::flip_prefill_to_decode(std::string& instance_name) {
-  std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
-  // Flip in all managers
-  for (auto& pair : model_instance_mgrs_) {
-    pair.second->flip_prefill_to_decode(instance_name);
+  {
+    std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+    // Flip in all managers
+    for (auto& pair : model_instance_mgrs_) {
+      pair.second->flip_prefill_to_decode(instance_name);
+    }
   }
   
+  std::unique_lock<std::shared_mutex> inst_lock(inst_mutex_);
   if (instances_.find(instance_name) == instances_.end()) {
     LOG(ERROR) << "Can't find instance, instance_name: " << instance_name;
     return;
@@ -848,13 +852,17 @@ void InstanceMgr::flip_prefill_to_decode(std::string& instance_name) {
   LOG(INFO) << "Flip prefill to decode, instance name : " << instance_name;
 }
 
+// flip all models
 void InstanceMgr::flip_decode_to_prefill(std::string& instance_name) {
-  std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
-  // Flip in all managers
-  for (auto& pair : model_instance_mgrs_) {
-    pair.second->flip_decode_to_prefill(instance_name);
+  {
+    std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+    // Flip in all managers
+    for (auto& pair : model_instance_mgrs_) {
+      pair.second->flip_decode_to_prefill(instance_name);
+    }
   }
   
+  std::unique_lock<std::shared_mutex> inst_lock(inst_mutex_);
   if (instances_.find(instance_name) == instances_.end()) {
     LOG(ERROR) << "Can't find instance, instance_name: " << instance_name;
     return;
@@ -1253,90 +1261,64 @@ EvictionPlanInfo InstanceMgr::select_eviction_candidates(const std::string& inst
 }
 
 void InstanceMgr::auto_scaling() {
-  const int hottest_model_target_count = 4;
-  const int second_hottest_model_target_count = 3;
+  // Part 1: Distribute instances among models (Scaling Up/Down)
+  const std::vector<int> rank_targets = {4, 3}; // Target counts for Top 1, Top 2, etc.
 
-  // 1. Identify the hottest and second hottest model
-  std::string hottest_model = "";
-  int64_t max_heat = 0;
+  struct ModelHeat {
+    std::string id;
+    int64_t heat;
+  };
+  std::vector<ModelHeat> sorted_models;
 
-  std::string second_hottest_model = "";
-  int64_t second_max_heat = 0;
-  
   {
     std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
     for (const auto& pair : model_instance_mgrs_) {
-      int64_t current_heat = pair.second->get_model_heat();
-      if (current_heat > max_heat) {
-
-        second_max_heat = max_heat;
-        second_hottest_model = hottest_model;
-
-        max_heat = current_heat;
-        hottest_model = pair.first;
-
-      } else if (current_heat > second_max_heat) {
-        second_max_heat = current_heat;
-        second_hottest_model = pair.first;
-      }
-    }
-  }
-
-  if (hottest_model.empty()) {
-    return;
-  }
-  
-  LOG(INFO) << "Current model heats:";
-  {
-    std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
-    for (const auto& pair : model_instance_mgrs_) {
+      sorted_models.push_back({pair.first, pair.second->get_model_heat()});
       LOG(INFO) << "Model " << pair.first << ": Heat = " << pair.second->get_model_heat();
     }
   }
 
-  LOG(INFO) << "Hottest model: " << (hottest_model.empty() ? "None" : hottest_model) << " with heat: " << max_heat;
-  LOG(INFO) << "Second hottest model: " << second_hottest_model << " with heat: " << second_max_heat;
+  std::sort(sorted_models.begin(), sorted_models.end(),
+            [](const ModelHeat& a, const ModelHeat& b) {
+              return a.heat > b.heat;
+            });
 
-  auto model_mgr = get_model_instance_mgr(hottest_model);
-  int hottest_model_count_margin = hottest_model_target_count - model_mgr->get_allocation_count();
-  if (hottest_model_count_margin > 0) {
-    auto instance_names = allocate_instance_for_model(hottest_model, /*target_model_count*/ hottest_model_target_count);
+  for (size_t i = 0; i < sorted_models.size(); ++i) {
+    if (i >= rank_targets.size()) break;
 
-    if (instance_names.empty()) {
-      LOG(ERROR) << "Auto scaling failed: unable to allocate instance for hottest model " << hottest_model;
-    } else {
-      LOG(INFO) << "Auto scaling: hottest model " << hottest_model
-                <<" needs to allocate " << hottest_model_count_margin
-                << " instances, allocated " << instance_names.size() << " instances:";
-      for (auto& instance_name : instance_names) {
-        LOG(INFO) << instance_name;
+    const auto& model_info = sorted_models[i];
+    if (model_info.heat == 0) continue; // Skip if no heat
+
+    int target_count = rank_targets[i];
+    auto model_mgr = get_model_instance_mgr(model_info.id);
+    int count_margin = target_count - model_mgr->get_allocation_count();
+
+    if (count_margin > 0) {
+      LOG(INFO) << "Auto scaling: model " << model_info.id << " (Rank " << i + 1
+                << ", Heat " << model_info.heat << ") needs " << count_margin << " more instances.";
+      auto instance_names = allocate_instance_for_model(model_info.id, target_count);
+      
+      if (!instance_names.empty()) {
+        LOG(INFO) << "Allocated " << instance_names.size() << " instances for " << model_info.id << ":";
+        for (const auto& name : instance_names) {
+          LOG(INFO) << "  " << name;
+        }
+      } else {
+        LOG(ERROR) << "Failed to allocate instances for " << model_info.id;
       }
+    } else {
+      LOG(INFO) << "Model " << model_info.id << " (Rank " << i + 1 << ") satisfied with "
+                << model_mgr->get_allocation_count() << " instances (Target: " << target_count << ").";
     }
-  } else {
-    LOG(INFO) << "No need to scale up, hottest model " << hottest_model << " already has " << hottest_model_target_count << " instances.";
   }
 
-  if (second_hottest_model.empty()) {
-    return;
-  }
-
-  model_mgr = get_model_instance_mgr(second_hottest_model);
-  int second_hottest_model_count_margin = second_hottest_model_target_count - model_mgr->get_allocation_count();
-  if (second_hottest_model_count_margin > 0) {
-    auto instance_names = allocate_instance_for_model(second_hottest_model, /*target_model_count*/ second_hottest_model_target_count);
-
-    if (instance_names.empty()) {
-      LOG(ERROR) << "Auto scaling failed: unable to allocate instance for second hottest model " << second_hottest_model;
-    } else {
-      LOG(INFO) << "Auto scaling: second hottest model " << second_hottest_model
-                <<" needs to allocate " << second_hottest_model_count_margin
-                << " instances, allocated " << instance_names.size() << " instances:";
-      for (auto& instance_name : instance_names) {
-        LOG(INFO) << instance_name;
-      }
+  // Part 2: Internal Prefill/Decode Instance Distribution (PD Separation)
+  {
+    std::lock_guard<std::mutex> lock(latency_metrics_mutex_);
+    std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+    for (const auto& pair : model_instance_mgrs_) {
+      pair.second->auto_scaling(latency_metrics_);
     }
-  } else {
-    LOG(INFO) << "No need to scale up, second hottest model " << second_hottest_model << " already has " << second_hottest_model_target_count << " instances.";
   }
 }
 
