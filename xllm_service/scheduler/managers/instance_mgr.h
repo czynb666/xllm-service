@@ -54,6 +54,8 @@ class InstanceMgr final {
   
   static constexpr int kMaxWakeupTimeoutms = 10000;
 
+  static constexpr int kTensorParallelSize = 2;
+
  public:
   explicit InstanceMgr(const Options& options,
                        const std::shared_ptr<EtcdClient>& etcd_client,
@@ -213,7 +215,7 @@ class InstanceMgr final {
   // count, prefill request count, estimated prefill execution time, decode
   // token count, and decode request count.
   std::mutex request_metrics_mutex_;
-  std::unordered_map<std::string, RequestMetrics> request_metrics_;
+  std::unordered_map<std::string, RequestMetrics> request_metrics_;  
   
   std::mutex allocation_mutex_;
 

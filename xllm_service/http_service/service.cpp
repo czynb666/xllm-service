@@ -175,10 +175,18 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
     }
   }
 
+  LOG(INFO) << "@@@ In handle()";
+
   // sync redistribute the request and wait the response.
   // because this handle is aysnc called in dispatch_callback.
   auto& target_uri = request->routing.prefill_name;
   brpc::Channel* channel_ptr = scheduler_->get_channel(target_uri).get();
+
+  if (channel_ptr == nullptr) {
+    LOG(ERROR) << "Get channel failed for target: " << target_uri;
+    call_data->finish_with_error("Internal error: channel not found.");
+    return;
+  }
 
   brpc::Controller* redirect_cntl = new brpc::Controller();
   redirect_cntl->http_request().uri() = (target_uri + method).c_str();
@@ -403,6 +411,9 @@ void XllmHttpServiceImpl::Completions(
     if (service_request == nullptr) {
       return;
     }
+
+    LOG(INFO) << "@@ In dispatch_callback";
+
     // update request protobuf
     req_pb->set_service_request_id(service_request->service_request_id);
     req_pb->mutable_token_ids()->Add(service_request->token_ids.begin(),
@@ -419,6 +430,8 @@ void XllmHttpServiceImpl::Completions(
       call_data->finish_with_error("proto to json failed");
       return;
     }
+
+    LOG(INFO) << "@@ Dispatch_callback before handle.";
 
     handle(call_data, req_attachment, service_request, "/v1/completions");
   };

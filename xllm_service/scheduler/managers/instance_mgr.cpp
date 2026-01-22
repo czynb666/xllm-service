@@ -216,27 +216,66 @@ void InstanceMgr::fork_master_and_sleep(
     std::shared_ptr<brpc::Channel> channel) {
   for (const auto& model : MODELS) {
     // 1. Fork Master
+
     nlohmann::json fork_body;
     fork_body["model_path"] = model.second;
     fork_body["master_node_addr"] = "127.0.0.1:" + std::to_string(++master_node_port);
-    fork_body["master_status"] = 0;
+    fork_body["master_status"] = 1;
 
-    bool fork_success = false;
-    for (int i = 0; i < 10; ++i) {
-      if (send_http_request(channel, "/fork_master", fork_body.dump())) {
-        fork_success = true;
-        break;
-      }
-      LOG(WARNING) << "Failed to fork master for model " << model.first << " on "
-                   << instance_name << ", retry " << i + 1;
-      std::this_thread::sleep_for(std::chrono::seconds(1));
+    auto model_id = model.first;
+
+    /* hardcoded for now */
+    int base_port = stoi(instance_name.substr(instance_name.find(":") + 1));
+
+    std::vector<std::thread> fork_threads;
+    std::atomic<int> fork_success_count(0);
+
+    for (int node_idx = 0; node_idx < kTensorParallelSize; ++node_idx) {
+      
+      /* hardcoded for now */
+      int tmp_port = base_port + node_idx;
+      std::string tmp_instance_name = instance_name.substr(0, instance_name.find(":")) +
+                                      ":" + std::to_string(tmp_port);
+      std::shared_ptr<brpc::Channel> tmp_channel = cached_channels_[tmp_instance_name];
+
+
+      fork_threads.emplace_back([this, tmp_instance_name, node_idx, fork_body, model_id, tmp_channel, &fork_success_count]() {
+        // send fork request
+
+        if (node_idx > 0) {
+          std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+
+        for (int i = 0; i < 10; ++i) {
+          if (send_http_request(tmp_channel, "/fork_master", fork_body.dump())) {
+            fork_success_count += 1;
+            break;
+          }
+          LOG(WARNING) << "Failed to fork master for model " << model_id << " on "
+                       << tmp_instance_name << ", retry " << i + 1;
+          std::this_thread::sleep_for(std::chrono::seconds(1));
+        }      
+
+      });
+
     }
 
-    if (!fork_success) {
+    for (auto& t : fork_threads) {
+      if (t.joinable()) {
+        t.join();
+      }
+    }
+
+    if (fork_success_count.load() != kTensorParallelSize) {
       LOG(ERROR) << "Failed to fork master for model " << model.first << " on "
-                 << instance_name << " after retries";
+                << instance_name << " after retries";
       continue;
     }
+
+    auto mgr = get_model_instance_mgr(model.first);
+    mgr->set_model_state(instance_name, ModelState::SLEEP);
+
+    continue;
 
     // 2. Sleep
     nlohmann::json sleep_body;
@@ -422,6 +461,20 @@ void InstanceMgr::register_instance(const std::string& instance_name,
   if (!create_channel(instance_name)) {
     LOG(ERROR) << "create channel fail: " << instance_name;
     return;
+  }
+
+  /* hardcoded for now*/
+  if (kTensorParallelSize > 1) {
+    for (int node_idx = 1; node_idx < kTensorParallelSize; ++node_idx) {
+      int instance_port = stoi(instance_name.substr(instance_name.find(":") + 1));
+      int tmp_port = instance_port + node_idx;
+      std::string tmp_instance_name = instance_name.substr(0, instance_name.find(":")) +
+                                      ":" + std::to_string(tmp_port);
+      if (!create_channel(tmp_instance_name)) {
+        LOG(ERROR) << "create channel fail: " << tmp_instance_name;
+        return;
+      }
+    }
   }
   
   // Note: we can't call fork_master_and_sleep here if we are holding
@@ -676,8 +729,8 @@ void InstanceMgr::update_latency_metrics(
   for (const auto& entry : latency_metrics.model_metrics()) {
     const std::string& model_id = entry.first;
     const auto& proto_model_metrics = entry.second;
-    
-    LatencyMetrics::ModelLatencyMetrics model_metrics;
+
+    ModelLatencyMetrics model_metrics;
     model_metrics.recent_max_ttft = proto_model_metrics.recent_max_ttft();
     model_metrics.recent_max_tbt = proto_model_metrics.recent_max_tbt();
     
@@ -1261,6 +1314,10 @@ EvictionPlanInfo InstanceMgr::select_eviction_candidates(const std::string& inst
 }
 
 void InstanceMgr::auto_scaling() {
+
+  LOG(INFO) << "~~ Auto scaling disabled.";
+  return;
+
   // Part 1: Distribute instances among models (Scaling Up/Down)
   const std::vector<int> rank_targets = {4, 3}; // Target counts for Top 1, Top 2, etc.
 
@@ -1317,7 +1374,7 @@ void InstanceMgr::auto_scaling() {
     std::lock_guard<std::mutex> lock(latency_metrics_mutex_);
     std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
     for (const auto& pair : model_instance_mgrs_) {
-      pair.second->auto_scaling(latency_metrics_);
+      pair.second->auto_flipping(latency_metrics_);
     }
   }
 }

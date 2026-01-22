@@ -125,13 +125,14 @@ struct LoadMetrics {
   bool empty() const { return false; }
 };
 
+
+struct ModelLatencyMetrics {
+  int64_t recent_max_ttft = 0;
+  int64_t recent_max_tbt = 0;
+};
+
 // Record the latency monitoring metrics of the instance over the recent period
 struct LatencyMetrics {
-  struct ModelLatencyMetrics {
-    int64_t recent_max_ttft = 0;
-    int64_t recent_max_tbt = 0;
-  };
-
   LatencyMetrics() = default;
 
   // model_id -> metrics
@@ -146,17 +147,17 @@ enum class RequestAction : int32_t {
   CANCEL = 4,
 };
 
+struct ModelRequestMetrics {
+  std::condition_variable cv_idle;
+  int64_t prefill_request_num = 0;
+  int64_t prefill_token_num = 0;
+  int64_t decode_request_num = 0;
+  int64_t decode_token_num = 0;
+};
+
 // Record the request metrics of the instance
 struct RequestMetrics {
-
-  struct ModelRequestMetrics {
-    std::condition_variable cv_idle;
-    int64_t prefill_request_num = 0;
-    int64_t prefill_token_num = 0;
-    int64_t decode_request_num = 0;
-    int64_t decode_token_num = 0;
-  };
-
+  
   RequestMetrics() = default;
 
   // model_id -> metrics

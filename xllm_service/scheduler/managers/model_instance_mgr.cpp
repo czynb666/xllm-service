@@ -30,9 +30,9 @@ void ModelInstanceMgr::add_instance(const std::string& instance_name, const Inst
   std::unique_lock<std::shared_mutex> lock(mutex_);
   instances_[instance_name] = info;
   
-  if (info.type() == proto::InstanceType::PREFILL) {
+  if (info.type == InstanceType::PREFILL) {
     prefill_index_.push_back(instance_name);
-  } else if (info.type() == proto::InstanceType::DECODE) {
+  } else if (info.type == InstanceType::DECODE) {
     decode_index_.push_back(instance_name);
   } else {
     // default/mix
@@ -322,7 +322,7 @@ void ModelInstanceMgr::prune_model_heat_locked() {
   }
 }
 
-void ModelInstanceMgr::auto_scaling(const std::unordered_map<std::string, LatencyMetrics>& latency_metrics) {
+void ModelInstanceMgr::auto_flipping(const std::unordered_map<std::string, LatencyMetrics>& latency_metrics) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   std::shared_lock<std::shared_mutex> state_lock(instance_state_all_mutex_);
 

@@ -67,7 +67,7 @@ class ModelInstanceMgr {
   
   std::shared_mutex* get_instance_state_single_mutex(const std::string& instance_name);
 
-  void auto_scaling(const std::unordered_map<std::string, LatencyMetrics>& latency_metrics);
+  void auto_flipping(const std::unordered_map<std::string, LatencyMetrics>& latency_metrics);
 
  private:
   bool send_http_request(std::shared_ptr<brpc::Channel> channel,
