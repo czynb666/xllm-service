@@ -223,7 +223,7 @@ void Scheduler::process_request_queue(const std::string& model_name) {
     }
 
     if (request->dispatch_callback) {
-      std::thread([request]() { request->dispatch_callback(); }).detach();
+      dispatch_pool_.schedule([request]() { request->dispatch_callback(); });
     }
   }
 }
