@@ -1537,7 +1537,19 @@ bool InstanceMgr::should_accept_scaling_plan(
 
 void InstanceMgr::dynamic_part_auto_scaling() {
   std::unique_lock<std::mutex> alloc_lock(allocation_mutex_);
+  dynamic_part_auto_scaling_impl();
+}
 
+bool InstanceMgr::try_dynamic_part_auto_scaling() {
+  std::unique_lock<std::mutex> alloc_lock(allocation_mutex_, std::try_to_lock);
+  if (!alloc_lock.owns_lock()) {
+    return false;
+  }
+  dynamic_part_auto_scaling_impl();
+  return true;
+}
+
+void InstanceMgr::dynamic_part_auto_scaling_impl() {
   int32_t total_gpus = total_available_gpus_.load();
   // Budget: total GPUs minus steady pool reservation
   int32_t budget = std::max(0, total_gpus - steady_needed_gpus());

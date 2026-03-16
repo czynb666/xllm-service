@@ -127,6 +127,10 @@ class InstanceMgr final {
   // Budget = total_gpus - steady_needed_gpus.
   void dynamic_part_auto_scaling();
 
+  // Non-blocking variant: try_lock on allocation_mutex_; if the lock is already
+  // held (another scaling in progress), return false immediately without scaling.
+  bool try_dynamic_part_auto_scaling();
+
   std::shared_ptr<ModelInstanceMgr> get_model_instance_mgr(const std::string& model_id);
 
   // --- Dual-pool scheduling ---
@@ -200,6 +204,9 @@ class InstanceMgr final {
   double get_model_memory_size(const std::string& model_id);
 
   // --- Dual-pool private helpers ---
+
+  // Auto-scaling implementation. Must be called with allocation_mutex_ held.
+  void dynamic_part_auto_scaling_impl();
 
   // 2D First Fit: find a bin for a model, or create a new one.
   // If all instances occupied, reclaims from elastic pool (blocking).
