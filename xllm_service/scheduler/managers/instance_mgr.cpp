@@ -39,6 +39,30 @@ limitations under the License.
 
 namespace xllm_service {
 
+// Compute cosine similarity between item needs vector and bin load vector.
+// Both are normalized to [0,1] by dividing by gpu_hw_spec capacities.
+// Returns 2.0 (> any valid cosine) if either vector is zero-length.
+static double compute_cos_similarity(
+    const ResourceNeeds& needs, const SteadyBin& bin,
+    const GpuHardwareSpec& hw) {
+  // Item vector (normalized to [0,1])
+  double v1 = needs.hbm_gb / hw.hbm_per_gpu_gb;
+  double v2 = needs.compute_sm / hw.compute_sm_per_gpu;
+  double v3 = needs.bandwidth / hw.bandwidth_per_gpu;
+
+  // Bin load vector (normalized): used = capacity - remaining
+  double s1 = (hw.hbm_per_gpu_gb - bin.remaining_hbm_gb) / hw.hbm_per_gpu_gb;
+  double s2 = (hw.compute_sm_per_gpu - bin.remaining_compute_sm) / hw.compute_sm_per_gpu;
+  double s3 = (hw.bandwidth_per_gpu - bin.remaining_bandwidth) / hw.bandwidth_per_gpu;
+
+  double dot = v1 * s1 + v2 * s2 + v3 * s3;
+  double norm_v = std::sqrt(v1 * v1 + v2 * v2 + v3 * v3);
+  double norm_s = std::sqrt(s1 * s1 + s2 * s2 + s3 * s3);
+
+  if (norm_v < 1e-12 || norm_s < 1e-12) return 2.0;
+  return dot / (norm_v * norm_s);
+}
+
 static std::unordered_map<InstanceType, std::string> ETCD_KEYS_PREFIX_MAP = {
     {InstanceType::DEFAULT, "XLLM:DEFAULT:"},
     {InstanceType::PREFILL, "XLLM:PREFILL:"},
@@ -2154,20 +2178,34 @@ std::string InstanceMgr::find_or_create_steady_bin(
     const std::string& model_id, const ResourceNeeds& needs,
     bool allow_reclaim) {
 
-  // Phase 1: First Fit in existing bins
-  for (auto& bin : steady_bins_) {
-    if (bin.remaining_hbm_gb >= needs.hbm_gb &&
-        bin.remaining_compute_sm >= needs.compute_sm &&
-        bin.remaining_bandwidth >= needs.bandwidth) {
-      bin.remaining_hbm_gb -= needs.hbm_gb;
-      bin.remaining_compute_sm -= needs.compute_sm;
-      bin.remaining_bandwidth -= needs.bandwidth;
-      bin.models.insert(model_id);
-      LOG(INFO) << "Placed model " << model_id << " in existing steady bin "
-                << bin.instance_name << " (remaining hbm=" << bin.remaining_hbm_gb
-                << "GB, compute=" << bin.remaining_compute_sm
-                << ", bandwidth=" << bin.remaining_bandwidth << ")";
-      return bin.instance_name;
+  // Phase 1: min cos heuristic — select the feasible bin whose load vector
+  // is most orthogonal to the item's resource vector (minimizes cosine).
+  {
+    SteadyBin* best_bin = nullptr;
+    double best_cos = std::numeric_limits<double>::max();
+
+    for (auto& bin : steady_bins_) {
+      if (bin.remaining_hbm_gb >= needs.hbm_gb &&
+          bin.remaining_compute_sm >= needs.compute_sm &&
+          bin.remaining_bandwidth >= needs.bandwidth) {
+        double cos_val = compute_cos_similarity(needs, bin, gpu_hw_spec_);
+        if (cos_val < best_cos) {
+          best_cos = cos_val;
+          best_bin = &bin;
+        }
+      }
+    }
+    if (best_bin) {
+      best_bin->remaining_hbm_gb -= needs.hbm_gb;
+      best_bin->remaining_compute_sm -= needs.compute_sm;
+      best_bin->remaining_bandwidth -= needs.bandwidth;
+      best_bin->models.insert(model_id);
+      LOG(INFO) << "Placed model " << model_id << " in steady bin "
+                << best_bin->instance_name << " (min_cos=" << best_cos
+                << ", remaining hbm=" << best_bin->remaining_hbm_gb
+                << "GB, compute=" << best_bin->remaining_compute_sm
+                << ", bandwidth=" << best_bin->remaining_bandwidth << ")";
+      return best_bin->instance_name;
     }
   }
 
@@ -2263,8 +2301,11 @@ std::string InstanceMgr::find_or_create_steady_bin(
   return "";
 }
 
-void InstanceMgr::remove_model_from_steady_bin(const std::string& model_id) {
+std::vector<std::tuple<std::string, std::string, std::string>>
+InstanceMgr::remove_model_from_steady_bin(const std::string& model_id) {
   // Must be called with allocation_mutex_ held
+  std::vector<std::tuple<std::string, std::string, std::string>> moves;
+
   for (auto it = steady_bins_.begin(); it != steady_bins_.end(); ++it) {
     if (it->models.count(model_id)) {
       // Reclaim resources
@@ -2281,10 +2322,76 @@ void InstanceMgr::remove_model_from_steady_bin(const std::string& model_id) {
       if (it->models.empty()) {
         LOG(INFO) << "Steady bin " << it->instance_name << " is now empty, releasing";
         steady_bins_.erase(it);
+        return moves;
       }
-      return;
+
+      // Check imbalance ratio R(B) = min(S_k) / max(S_k)
+      // S_k = normalized load = (capacity - remaining) / capacity
+      double s1 = (gpu_hw_spec_.hbm_per_gpu_gb - it->remaining_hbm_gb)
+                   / gpu_hw_spec_.hbm_per_gpu_gb;
+      double s2 = (gpu_hw_spec_.compute_sm_per_gpu - it->remaining_compute_sm)
+                   / gpu_hw_spec_.compute_sm_per_gpu;
+      double s3 = (gpu_hw_spec_.bandwidth_per_gpu - it->remaining_bandwidth)
+                   / gpu_hw_spec_.bandwidth_per_gpu;
+
+      double s_min = std::min({s1, s2, s3});
+      double s_max = std::max({s1, s2, s3});
+      double R = (s_max > 1e-12) ? (s_min / s_max) : 1.0;
+
+      if (R >= 0.5) {
+        return moves;  // balanced enough
+      }
+
+      // R(B) < 0.5 — trigger per-bin repack (装箱.pdf §2.3)
+      LOG(INFO) << "Bin " << it->instance_name << " imbalance ratio R=" << R
+                << " < 0.5, triggering per-bin repack";
+
+      std::string old_instance = it->instance_name;
+      std::vector<std::string> displaced_models(it->models.begin(),
+                                                it->models.end());
+
+      // Erase the unbalanced bin
+      steady_bins_.erase(it);
+
+      // Re-insert each displaced model via min cos (no elastic reclamation)
+      std::vector<std::string> fallback_models;
+      for (const auto& mid : displaced_models) {
+        ResourceNeeds mid_needs = get_model_resource_needs(mid);
+        std::string new_instance =
+            find_or_create_steady_bin(mid, mid_needs, /*allow_reclaim=*/false);
+
+        if (new_instance.empty()) {
+          // Couldn't place — will go to fallback bin on old_instance
+          fallback_models.push_back(mid);
+        } else if (new_instance != old_instance) {
+          moves.emplace_back(mid, old_instance, new_instance);
+        }
+        // if new_instance == old_instance, model stays put (no move needed)
+      }
+
+      // Create fallback bin on old_instance for unplaced models
+      if (!fallback_models.empty()) {
+        SteadyBin fallback_bin;
+        fallback_bin.instance_name = old_instance;
+        fallback_bin.remaining_hbm_gb = gpu_hw_spec_.hbm_per_gpu_gb;
+        fallback_bin.remaining_compute_sm = gpu_hw_spec_.compute_sm_per_gpu;
+        fallback_bin.remaining_bandwidth = gpu_hw_spec_.bandwidth_per_gpu;
+        for (const auto& mid : fallback_models) {
+          ResourceNeeds mid_needs = get_model_resource_needs(mid);
+          fallback_bin.remaining_hbm_gb -= mid_needs.hbm_gb;
+          fallback_bin.remaining_compute_sm -= mid_needs.compute_sm;
+          fallback_bin.remaining_bandwidth -= mid_needs.bandwidth;
+          fallback_bin.models.insert(mid);
+        }
+        steady_bins_.push_back(std::move(fallback_bin));
+        LOG(INFO) << "Created fallback bin on " << old_instance << " for "
+                  << fallback_models.size() << " unplaced models";
+      }
+
+      return moves;
     }
   }
+  return moves;
 }
 
 bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
@@ -2330,7 +2437,7 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
   // Upgrade to elastic
   pool_it->second = PoolType::ELASTIC;
 
-  remove_model_from_steady_bin(model_id);
+  auto repack_moves = remove_model_from_steady_bin(model_id);
 
   alloc_lock.unlock();
 
@@ -2347,6 +2454,17 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
       if (!wait_for_model_drain(inst, mid)) return;
       send_model_sleep(inst, mid);
     }).detach();
+  }
+
+  // Execute R(B) repack moves: wake on new instance, drain+sleep on old
+  for (const auto& [mid, old_inst, new_inst] : repack_moves) {
+    LOG(INFO) << "R(B) repack: moving model " << mid
+              << " from " << old_inst << " to " << new_inst;
+    send_model_wakeup(new_inst, mid, false);
+    auto mgr = get_model_instance_mgr(mid);
+    if (mgr) mgr->set_model_state(old_inst, ModelState::DRAINING);
+    wait_for_model_drain(old_inst, mid);
+    send_model_sleep(old_inst, mid);
   }
 
   return true;
@@ -2409,23 +2527,33 @@ InstanceMgr::repack_steady_bins() {
     old_instances.push_back(bin.instance_name);
   }
 
-  // Build new bins with FFD
+  // Build new bins with FFD + min cos placement
   std::vector<SteadyBin> new_bins;
   size_t next_old_instance = 0;
 
   for (const auto& item : items) {
     bool placed = false;
+
+    // min cos: find the feasible bin with minimum cosine similarity
+    SteadyBin* best = nullptr;
+    double best_cos = std::numeric_limits<double>::max();
     for (auto& bin : new_bins) {
       if (bin.remaining_hbm_gb >= item.needs.hbm_gb &&
           bin.remaining_compute_sm >= item.needs.compute_sm &&
           bin.remaining_bandwidth >= item.needs.bandwidth) {
-        bin.remaining_hbm_gb -= item.needs.hbm_gb;
-        bin.remaining_compute_sm -= item.needs.compute_sm;
-        bin.remaining_bandwidth -= item.needs.bandwidth;
-        bin.models.insert(item.model_id);
-        placed = true;
-        break;
+        double cos_val = compute_cos_similarity(item.needs, bin, gpu_hw_spec_);
+        if (cos_val < best_cos) {
+          best_cos = cos_val;
+          best = &bin;
+        }
       }
+    }
+    if (best) {
+      best->remaining_hbm_gb -= item.needs.hbm_gb;
+      best->remaining_compute_sm -= item.needs.compute_sm;
+      best->remaining_bandwidth -= item.needs.bandwidth;
+      best->models.insert(item.model_id);
+      placed = true;
     }
     if (!placed) {
       // Open new bin, preferring old steady instances

@@ -217,7 +217,11 @@ class InstanceMgr final {
 
   // Remove a model from its steady bin, reclaiming resources.
   // Must be called with allocation_mutex_ held.
-  void remove_model_from_steady_bin(const std::string& model_id);
+  // If removal causes imbalance ratio R(B) < 0.5, triggers per-bin repack:
+  // all remaining models are evicted and re-inserted via min cos heuristic.
+  // Returns (model_id, old_instance, new_instance) moves from repack.
+  std::vector<std::tuple<std::string, std::string, std::string>>
+      remove_model_from_steady_bin(const std::string& model_id);
 
   // Get resource needs for a model using its current heat.
   ResourceNeeds get_model_resource_needs(const std::string& model_id);
