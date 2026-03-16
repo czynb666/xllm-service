@@ -77,6 +77,12 @@ class Options {
 
   // LST-IMH pre-pull threshold in milliseconds
   PROPERTY(int32_t, lst_imh_pre_pull_ms) = 0;
+
+  // SLO penalty factor: multiply SLO by this when deadline expires (re-enqueue)
+  PROPERTY(double, slo_penalty_factor) = 2.0;
+
+  // Max number of SLO expansions before truly discarding
+  PROPERTY(int32_t, max_slo_expansions) = 3;
 };
 
 }  // namespace xllm_service

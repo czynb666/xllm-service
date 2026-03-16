@@ -196,7 +196,9 @@ int main(int argc, char* argv[]) {
       .block_size(FLAGS_block_size)
       .tokenizer_path(FLAGS_tokenizer_path)
       .default_ttft_slo_ms(FLAGS_default_ttft_slo_ms)
-      .lst_imh_pre_pull_ms(FLAGS_lst_imh_pre_pull_ms);
+      .lst_imh_pre_pull_ms(FLAGS_lst_imh_pre_pull_ms)
+      .slo_penalty_factor(FLAGS_slo_penalty_factor)
+      .max_slo_expansions(FLAGS_max_slo_expansions);
 
   xllm_service::Master master(options);
 
