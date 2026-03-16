@@ -126,3 +126,17 @@ DEFINE_double(gpu_hbm_per_gpu_gb,
 DEFINE_double(gpu_compute_sm_per_gpu,
               1.0,
               "Compute SM units per GPU, used for auto-scaling resource model.");
+
+DEFINE_double(gpu_bandwidth_per_gpu,
+              1.0,
+              "HBM-to-SRAM bandwidth capacity per GPU (normalized).");
+
+DEFINE_string(gp_steady_data_path,
+              "",
+              "Path to JSON file containing GP training data for steady pool "
+              "resource model. Empty means use linear fallback.");
+
+DEFINE_string(gp_dynamic_data_path,
+              "",
+              "Path to JSON file containing GP training data for dynamic pool "
+              "resource model. Empty means use linear fallback.");

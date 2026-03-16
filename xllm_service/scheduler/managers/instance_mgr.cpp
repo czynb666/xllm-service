@@ -20,6 +20,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <chrono>
+#include <fstream>
 #include <thread>
 #include <iostream>
 #include <nlohmann/json.hpp>
@@ -29,6 +30,8 @@ limitations under the License.
 #include <shared_mutex>
 
 #include "scheduler/resource_model/linear_resource_model.h"
+#include "scheduler/resource_model/gp_steady_resource_model.h"
+#include "scheduler/resource_model/gp_dynamic_resource_model.h"
 
 #include "common/global_gflags.h"
 #include "common/types.h"
@@ -1231,19 +1234,135 @@ void InstanceMgr::init_model_memory_specs() {
 void InstanceMgr::init_model_resource_coefficients() {
   gpu_hw_spec_.hbm_per_gpu_gb = FLAGS_gpu_hbm_per_gpu_gb;
   gpu_hw_spec_.compute_sm_per_gpu = FLAGS_gpu_compute_sm_per_gpu;
+  gpu_hw_spec_.bandwidth_per_gpu = FLAGS_gpu_bandwidth_per_gpu;
 
-  // Hardcoded resource coefficients per model
-  model_resource_models_["Qwen3-8B"] = std::make_unique<LinearResourceModel>(
-      /*hbm_a=*/0.001, /*hbm_b=*/20.0,
-      /*compute_a=*/0.0005, /*compute_b=*/0.0);
-  model_resource_models_["Qwen2-7B"] = std::make_unique<LinearResourceModel>(
-      /*hbm_a=*/0.001, /*hbm_b=*/20.0,
-      /*compute_a=*/0.0005, /*compute_b=*/0.0);
+  // Load GP models from JSON files if paths are provided
+  if (!FLAGS_gp_steady_data_path.empty()) {
+    load_gp_steady_models(FLAGS_gp_steady_data_path);
+  }
+  if (!FLAGS_gp_dynamic_data_path.empty()) {
+    load_gp_dynamic_models(FLAGS_gp_dynamic_data_path);
+  }
+
+  // Fallback: hardcoded linear models for models without GP data
+  if (model_resource_models_.find("Qwen3-8B") == model_resource_models_.end()) {
+    model_resource_models_["Qwen3-8B"] = std::make_unique<LinearResourceModel>(
+        /*hbm_a=*/0.001, /*hbm_b=*/20.0,
+        /*compute_a=*/0.0005, /*compute_b=*/0.0);
+  }
+  if (model_resource_models_.find("Qwen2-7B") == model_resource_models_.end()) {
+    model_resource_models_["Qwen2-7B"] = std::make_unique<LinearResourceModel>(
+        /*hbm_a=*/0.001, /*hbm_b=*/20.0,
+        /*compute_a=*/0.0005, /*compute_b=*/0.0);
+  }
 
   LOG(INFO) << "Initialized model resource models for "
-            << model_resource_models_.size() << " models, "
+            << model_resource_models_.size() << " steady models, "
+            << dynamic_resource_models_.size() << " dynamic models, "
             << "GPU HBM=" << gpu_hw_spec_.hbm_per_gpu_gb << "GB, "
-            << "GPU compute SM=" << gpu_hw_spec_.compute_sm_per_gpu;
+            << "GPU compute SM=" << gpu_hw_spec_.compute_sm_per_gpu << ", "
+            << "GPU bandwidth=" << gpu_hw_spec_.bandwidth_per_gpu;
+}
+
+static std::unique_ptr<GaussianProcess> parse_gp_from_json(
+    const nlohmann::json& j) {
+  const auto& X_arr = j.at("X");
+  const auto& y_arr = j.at("y");
+  const auto& ls_arr = j.at("lengthscales");
+  double signal_var = j.at("signal_variance").get<double>();
+  double noise_var = j.at("noise_variance").get<double>();
+
+  int n = X_arr.size();
+  int d = ls_arr.size();
+
+  Eigen::MatrixXd X(n, d);
+  for (int i = 0; i < n; ++i) {
+    for (int k = 0; k < d; ++k) {
+      X(i, k) = X_arr[i][k].get<double>();
+    }
+  }
+
+  Eigen::VectorXd y(n);
+  for (int i = 0; i < n; ++i) {
+    y(i) = y_arr[i].get<double>();
+  }
+
+  Eigen::VectorXd ls(d);
+  for (int i = 0; i < d; ++i) {
+    ls(i) = ls_arr[i].get<double>();
+  }
+
+  return std::make_unique<GaussianProcess>(X, y, ls, signal_var, noise_var);
+}
+
+void InstanceMgr::load_gp_steady_models(const std::string& path) {
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    LOG(ERROR) << "Failed to open GP steady data file: " << path;
+    return;
+  }
+
+  nlohmann::json data;
+  try {
+    file >> data;
+  } catch (const nlohmann::json::parse_error& e) {
+    LOG(ERROR) << "Failed to parse GP steady data JSON: " << e.what();
+    return;
+  }
+
+  for (auto it = data.begin(); it != data.end(); ++it) {
+    const std::string& model_id = it.key();
+    const auto& model_data = it.value();
+
+    try {
+      auto gp_hbm = parse_gp_from_json(model_data.at("hbm"));
+      auto gp_compute = parse_gp_from_json(model_data.at("compute"));
+      auto gp_bandwidth = parse_gp_from_json(model_data.at("bandwidth"));
+
+      model_resource_models_[model_id] =
+          std::make_unique<GPSteadyResourceModel>(
+              std::move(gp_hbm), std::move(gp_compute),
+              std::move(gp_bandwidth));
+
+      LOG(INFO) << "Loaded GP steady resource model for " << model_id;
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Failed to load GP steady model for " << model_id
+                 << ": " << e.what();
+    }
+  }
+}
+
+void InstanceMgr::load_gp_dynamic_models(const std::string& path) {
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    LOG(ERROR) << "Failed to open GP dynamic data file: " << path;
+    return;
+  }
+
+  nlohmann::json data;
+  try {
+    file >> data;
+  } catch (const nlohmann::json::parse_error& e) {
+    LOG(ERROR) << "Failed to parse GP dynamic data JSON: " << e.what();
+    return;
+  }
+
+  for (auto it = data.begin(); it != data.end(); ++it) {
+    const std::string& model_id = it.key();
+    const auto& model_data = it.value();
+
+    try {
+      auto gp_slo = parse_gp_from_json(model_data);
+
+      dynamic_resource_models_[model_id] =
+          std::make_unique<GPDynamicResourceModel>(std::move(gp_slo));
+
+      LOG(INFO) << "Loaded GP dynamic resource model for " << model_id;
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Failed to load GP dynamic model for " << model_id
+                 << ": " << e.what();
+    }
+  }
 }
 
 // TODO: support dynamic instance memory specs, rather than hardcoded.
@@ -1970,8 +2089,8 @@ ResourceNeeds InstanceMgr::get_model_resource_needs(const std::string& model_id)
   if (it != model_resource_models_.end()) {
     return it->second->compute_resource_needs(heat);
   }
-  // Default: use hbm_b=20GB, compute_b=0 for unknown models
-  return {20.0, 0.0};
+  // Default: use hbm_b=20GB, compute_b=0, bandwidth=0 for unknown models
+  return {20.0, 0.0, 0.0};
 }
 
 void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
@@ -2003,7 +2122,7 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
     // Steady pool
     ResourceNeeds needs = (res_it != model_resource_models_.end())
         ? res_it->second->compute_resource_needs(heat)
-        : ResourceNeeds{20.0, 0.0};
+        : ResourceNeeds{20.0, 0.0, 0.0};
 
     std::string instance = find_or_create_steady_bin(model_id, needs);
     if (instance.empty()) {
@@ -2038,13 +2157,16 @@ std::string InstanceMgr::find_or_create_steady_bin(
   // Phase 1: First Fit in existing bins
   for (auto& bin : steady_bins_) {
     if (bin.remaining_hbm_gb >= needs.hbm_gb &&
-        bin.remaining_compute_sm >= needs.compute_sm) {
+        bin.remaining_compute_sm >= needs.compute_sm &&
+        bin.remaining_bandwidth >= needs.bandwidth) {
       bin.remaining_hbm_gb -= needs.hbm_gb;
       bin.remaining_compute_sm -= needs.compute_sm;
+      bin.remaining_bandwidth -= needs.bandwidth;
       bin.models.insert(model_id);
       LOG(INFO) << "Placed model " << model_id << " in existing steady bin "
                 << bin.instance_name << " (remaining hbm=" << bin.remaining_hbm_gb
-                << "GB, compute=" << bin.remaining_compute_sm << ")";
+                << "GB, compute=" << bin.remaining_compute_sm
+                << ", bandwidth=" << bin.remaining_bandwidth << ")";
       return bin.instance_name;
     }
   }
@@ -2080,6 +2202,7 @@ std::string InstanceMgr::find_or_create_steady_bin(
       new_bin.instance_name = inst_name;
       new_bin.remaining_hbm_gb = gpu_hw_spec_.hbm_per_gpu_gb - needs.hbm_gb;
       new_bin.remaining_compute_sm = gpu_hw_spec_.compute_sm_per_gpu - needs.compute_sm;
+      new_bin.remaining_bandwidth = gpu_hw_spec_.bandwidth_per_gpu - needs.bandwidth;
       new_bin.models.insert(model_id);
       steady_bins_.push_back(std::move(new_bin));
 
@@ -2127,6 +2250,7 @@ std::string InstanceMgr::find_or_create_steady_bin(
       new_bin.instance_name = inst_name;
       new_bin.remaining_hbm_gb = gpu_hw_spec_.hbm_per_gpu_gb - needs.hbm_gb;
       new_bin.remaining_compute_sm = gpu_hw_spec_.compute_sm_per_gpu - needs.compute_sm;
+      new_bin.remaining_bandwidth = gpu_hw_spec_.bandwidth_per_gpu - needs.bandwidth;
       new_bin.models.insert(model_id);
       steady_bins_.push_back(std::move(new_bin));
 
@@ -2147,6 +2271,7 @@ void InstanceMgr::remove_model_from_steady_bin(const std::string& model_id) {
       ResourceNeeds needs = get_model_resource_needs(model_id);
       it->remaining_hbm_gb += needs.hbm_gb;
       it->remaining_compute_sm += needs.compute_sm;
+      it->remaining_bandwidth += needs.bandwidth;
       it->models.erase(model_id);
 
       LOG(INFO) << "Removed model " << model_id << " from steady bin "
@@ -2259,9 +2384,10 @@ InstanceMgr::repack_steady_bins() {
       item.model_id = model_id;
       item.needs = get_model_resource_needs(model_id);
       item.old_instance = bin.instance_name;
-      item.dominant_ratio = std::max(
+      item.dominant_ratio = std::max({
           item.needs.hbm_gb / gpu_hw_spec_.hbm_per_gpu_gb,
-          item.needs.compute_sm / gpu_hw_spec_.compute_sm_per_gpu);
+          item.needs.compute_sm / gpu_hw_spec_.compute_sm_per_gpu,
+          item.needs.bandwidth / gpu_hw_spec_.bandwidth_per_gpu});
       items.push_back(std::move(item));
     }
   }
@@ -2291,9 +2417,11 @@ InstanceMgr::repack_steady_bins() {
     bool placed = false;
     for (auto& bin : new_bins) {
       if (bin.remaining_hbm_gb >= item.needs.hbm_gb &&
-          bin.remaining_compute_sm >= item.needs.compute_sm) {
+          bin.remaining_compute_sm >= item.needs.compute_sm &&
+          bin.remaining_bandwidth >= item.needs.bandwidth) {
         bin.remaining_hbm_gb -= item.needs.hbm_gb;
         bin.remaining_compute_sm -= item.needs.compute_sm;
+        bin.remaining_bandwidth -= item.needs.bandwidth;
         bin.models.insert(item.model_id);
         placed = true;
         break;
@@ -2331,6 +2459,7 @@ InstanceMgr::repack_steady_bins() {
       new_bin.instance_name = inst_name;
       new_bin.remaining_hbm_gb = gpu_hw_spec_.hbm_per_gpu_gb - item.needs.hbm_gb;
       new_bin.remaining_compute_sm = gpu_hw_spec_.compute_sm_per_gpu - item.needs.compute_sm;
+      new_bin.remaining_bandwidth = gpu_hw_spec_.bandwidth_per_gpu - item.needs.bandwidth;
       new_bin.models.insert(item.model_id);
       new_bins.push_back(std::move(new_bin));
     }

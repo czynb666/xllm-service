@@ -195,6 +195,8 @@ class InstanceMgr final {
  private:
   void init_model_memory_specs();
   void init_model_resource_coefficients();
+  void load_gp_steady_models(const std::string& path);
+  void load_gp_dynamic_models(const std::string& path);
   double get_model_memory_size(const std::string& model_id);
 
   // --- Dual-pool private helpers ---
@@ -340,6 +342,8 @@ class InstanceMgr final {
   std::atomic<int32_t> total_available_gpus_{0};
   // model_id -> resource model (read-only after init)
   std::unordered_map<std::string, std::unique_ptr<ResourceModel>> model_resource_models_;
+  // model_id -> dynamic pool GP resource model (read-only after init)
+  std::unordered_map<std::string, std::unique_ptr<ResourceModel>> dynamic_resource_models_;
   // GPU hardware spec (read-only after init)
   GpuHardwareSpec gpu_hw_spec_;
 

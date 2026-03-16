@@ -74,3 +74,9 @@ DECLARE_bool(enable_prefill_only_mode);
 DECLARE_double(gpu_hbm_per_gpu_gb);
 
 DECLARE_double(gpu_compute_sm_per_gpu);
+
+DECLARE_double(gpu_bandwidth_per_gpu);
+
+DECLARE_string(gp_steady_data_path);
+
+DECLARE_string(gp_dynamic_data_path);
