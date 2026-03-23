@@ -127,6 +127,9 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
     instance_mgr_->update_model_heat(request->model, request->token_ids.size());
   }
 
+  // Latency breakdown: tokenization done
+  request->tokenize_done_ms = absl::ToUnixMillis(absl::Now());
+
   // Push request to queue (all policies go through process_request_queue)
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -161,6 +164,9 @@ void Scheduler::process_request_queue(const std::string& model_name) {
     if (request == nullptr) {
       continue;
     }
+
+    // Latency breakdown: popped from queue
+    request->queue_exit_ms = absl::ToUnixMillis(absl::Now());
 
     // Dual-pool routing
     PoolType pool = instance_mgr_->get_model_pool(request->model);
@@ -219,6 +225,9 @@ void Scheduler::process_request_queue(const std::string& model_name) {
         }
       }
     }
+
+    // Latency breakdown: load balancing done
+    request->lb_done_ms = absl::ToUnixMillis(absl::Now());
 
     LOG(INFO) << "Dispatching request " << request->service_request_id
                << " model=" << request->model
@@ -433,6 +442,22 @@ void Scheduler::finish_request(const std::string& service_request_id,
     auto it = requests_.find(service_request_id);
     if (it != requests_.end()) {
       prefill_instance = it->second->routing.prefill_name;
+      // Latency breakdown: request finished
+      it->second->finish_ms = absl::ToUnixMillis(absl::Now());
+      {
+        auto& r = it->second;
+        LOG(INFO) << "[latency breakdown] req=" << r->service_request_id
+                  << " model=" << r->model
+                  << " prompt_len=" << r->token_ids.size()
+                  << " output_len=" << r->num_generated_tokens
+                  << " total=" << (r->finish_ms - r->arrival_time_ms) << "ms"
+                  << " tokenize=" << (r->tokenize_done_ms - r->arrival_time_ms) << "ms"
+                  << " queue_wait=" << (r->queue_exit_ms - r->tokenize_done_ms) << "ms"
+                  << " lb_select=" << (r->lb_done_ms - r->queue_exit_ms) << "ms"
+                  << " dispatch=" << (r->rpc_sent_ms - r->lb_done_ms) << "ms"
+                  << " engine_prefill=" << (r->first_token_ms - r->rpc_sent_ms) << "ms"
+                  << " engine_decode=" << (r->finish_ms - r->first_token_ms) << "ms";
+      }
       // update instance request metrics for finished request
       if (error) {
         instance_mgr_->update_request_metrics(it->second,
@@ -507,6 +532,8 @@ void Scheduler::update_request_metrics_for_prefill(
     if (it != requests_.end()) {
       prefill_instance = it->second->routing.prefill_name;
       it->second->num_generated_tokens += 1;
+      // Latency breakdown: first token received
+      it->second->first_token_ms = absl::ToUnixMillis(absl::Now());
       // update instance request metrics for prefill finished request
       instance_mgr_->update_request_metrics(it->second,
                                             RequestAction::FINISH_PREFILL);

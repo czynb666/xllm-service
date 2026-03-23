@@ -212,6 +212,8 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
                           request->service_request_id,
                           request->stream,
                           instance_info.enable_disagg_pd);
+    // Latency breakdown: RPC call sent to engine
+    request->rpc_sent_ms = absl::ToUnixMillis(absl::Now());
     channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
     if (redirect_cntl->Failed()) {
       call_data->finish_with_error(redirect_cntl->ErrorText());
@@ -229,6 +231,9 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
     // receive tokens in progressive mode.
     redirect_cntl->response_will_be_read_progressively();
 
+    // Latency breakdown: RPC call sent to engine
+    request->rpc_sent_ms = absl::ToUnixMillis(absl::Now());
+
     // Because `done'(last parameter) is NULL, this function waits until
     // the response comes back or error occurs(including timeout).
     channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, NULL);
@@ -243,6 +248,8 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
   } else {
     google::protobuf::Closure* done = brpc::NewCallback(
         &handle_non_stream_response<T>, redirect_cntl, call_data);
+    // Latency breakdown: RPC call sent to engine
+    request->rpc_sent_ms = absl::ToUnixMillis(absl::Now());
     channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
     if (redirect_cntl->Failed()) {
       call_data->finish_with_error(redirect_cntl->ErrorText());
@@ -426,6 +433,9 @@ void XllmHttpServiceImpl::Completions(
       return;
     }
 
+    // Latency breakdown: dispatch callback starts
+    service_request->dispatch_start_ms = absl::ToUnixMillis(absl::Now());
+
     // update request protobuf
     req_pb->set_service_request_id(service_request->service_request_id);
     req_pb->mutable_token_ids()->Add(service_request->token_ids.begin(),
@@ -530,6 +540,10 @@ void XllmHttpServiceImpl::ChatCompletions(
       call_data->finish_with_error("Internal error: request expired.");
       return;
     }
+
+    // Latency breakdown: dispatch callback starts
+    service_request->dispatch_start_ms = absl::ToUnixMillis(absl::Now());
+
     // update request protobuf
     req_pb->set_service_request_id(service_request->service_request_id);
     req_pb->mutable_token_ids()->Add(service_request->token_ids.begin(),

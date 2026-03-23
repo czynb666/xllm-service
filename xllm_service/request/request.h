@@ -79,6 +79,15 @@ struct Request {
   // will complete. Set at dispatch time, used for PREFILL_DONE correction feedback.
   int64_t expected_prefill_done_ms = 0;
 
+  // ---- Latency breakdown timestamps (ms since epoch) ----
+  int64_t tokenize_done_ms = 0;    // after chat template + prompt encode
+  int64_t queue_exit_ms = 0;       // popped from concurrent queue
+  int64_t lb_done_ms = 0;          // after load balancing selection
+  int64_t dispatch_start_ms = 0;   // dispatch_callback begins
+  int64_t rpc_sent_ms = 0;         // RPC CallMethod issued to engine
+  int64_t first_token_ms = 0;      // first token received (prefill done)
+  int64_t finish_ms = 0;           // request completed
+
   // dispatch callback
   // This callback will be called in a new thread after the request is scheduled.
   std::function<void()> dispatch_callback = nullptr;
