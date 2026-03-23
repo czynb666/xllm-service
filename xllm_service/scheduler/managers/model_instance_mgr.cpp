@@ -496,6 +496,21 @@ int64_t ModelInstanceMgr::get_model_heat() {
   return model_heat_;
 }
 
+double ModelInstanceMgr::get_avg_token_rate(int window_seconds) {
+  std::lock_guard<std::mutex> heat_lock(model_heat_mutex_);
+  if (window_seconds <= 0) return 0.0;
+  auto now = std::chrono::steady_clock::now();
+  int64_t total_tokens = 0;
+  for (const auto& record : model_heat_records_) {
+    auto age = std::chrono::duration_cast<std::chrono::seconds>(
+        now - record.timestamp).count();
+    if (age <= window_seconds) {
+      total_tokens += record.token_count;
+    }
+  }
+  return static_cast<double>(total_tokens) / window_seconds;
+}
+
 void ModelInstanceMgr::prune_model_heat_locked() {
   auto& records = model_heat_records_;
   auto now = std::chrono::steady_clock::now();

@@ -192,12 +192,12 @@ void Scheduler::process_request_queue(const std::string& model_name) {
 
       int32_t model_count = instance_mgr_->get_wakeup_count(request->model);
       if (model_count == 0) {
-        // Cold elastic model: blocking wakeup
-        instance_mgr_->dynamic_part_auto_scaling();
+        // Cold elastic model: signal auto-scaling thread and wait for wakeup
+        instance_mgr_->request_cold_elastic_wakeup(request->model);
 
         auto awake = instance_mgr_->get_awake_prefill_instances(request->model);
         if (awake.empty()) {
-          LOG(ERROR) << "dynamic_part_auto_scaling failed to wake model " << request->model
+          LOG(ERROR) << "request_cold_elastic_wakeup failed to wake model " << request->model
                      << " (request silently dropped!)";
           continue;
         }
@@ -232,12 +232,6 @@ void Scheduler::process_request_queue(const std::string& model_name) {
 
     if (request->dispatch_callback) {
       dispatch_pool_.schedule([request]() { request->dispatch_callback(); });
-    }
-
-    // Post-dispatch: trigger elastic scaling with try_lock to avoid blocking.
-    // Cold path already did blocking scaling above; warm path defers to here.
-    if (pool == PoolType::ELASTIC) {
-      instance_mgr_->try_dynamic_part_auto_scaling();
     }
   }
 }

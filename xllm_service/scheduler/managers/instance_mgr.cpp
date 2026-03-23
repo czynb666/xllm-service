@@ -125,6 +125,40 @@ void InstanceMgr::init() {
     });
   }
 
+  // Start dedicated auto-scaling thread
+  static constexpr int kAutoScalingIntervalMs = 500;
+  auto_scaling_thread_ = std::make_unique<std::thread>([this]() {
+    while (!exited_) {
+      {
+        std::unique_lock<std::mutex> lock(scaling_trigger_mutex_);
+        scaling_trigger_cv_.wait_for(
+            lock, std::chrono::milliseconds(kAutoScalingIntervalMs),
+            [this] { return scaling_requested_ || exited_; });
+        scaling_requested_ = false;
+      }
+      if (exited_) break;
+      try_dynamic_part_auto_scaling();
+    }
+  });
+
+  // Start low-frequency P/D metrics thread.
+  static constexpr int kPdMetricsIntervalSeconds = 1;
+  static constexpr int kInstanceMetricsIntervalTicks = 60;
+  pd_metrics_thread_ = std::make_unique<std::thread>([this]() {
+    int tick = 0;
+    while (!exited_) {
+      std::this_thread::sleep_for(
+          std::chrono::seconds(kPdMetricsIntervalSeconds));
+      if (exited_) break;
+      ++tick;
+      if (tick >= kInstanceMetricsIntervalTicks) {
+        log_instance_counts();
+        tick = 0;
+      }
+      log_model_pd_counts();
+    }
+  });
+
   {
     std::unique_lock<std::shared_mutex> lock(inst_mutex_);
     for (auto& it : ETCD_KEYS_PREFIX_MAP) {
@@ -211,8 +245,94 @@ void InstanceMgr::init() {
 
 InstanceMgr::~InstanceMgr() {
   exited_ = true;
+  // Wake the auto-scaling thread so it can exit.
+  scaling_trigger_cv_.notify_all();
+  if (auto_scaling_thread_ && auto_scaling_thread_->joinable()) {
+    auto_scaling_thread_->join();
+  }
   if (repack_thread_ && repack_thread_->joinable()) {
     repack_thread_->join();
+  }
+  if (demotion_thread_ && demotion_thread_->joinable()) {
+    demotion_thread_->join();
+  }
+  if (pd_metrics_thread_ && pd_metrics_thread_->joinable()) {
+    pd_metrics_thread_->join();
+  }
+}
+
+void InstanceMgr::log_instance_counts() {
+  int registered = 0;
+  int pending = 0;
+  {
+    std::shared_lock<std::shared_mutex> lock(inst_mutex_);
+    registered = static_cast<int>(instances_.size());
+  }
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    pending = static_cast<int>(pending_infos_.size());
+  }
+  LOG(INFO) << "Instance metrics: registered=" << registered
+            << " pending=" << pending
+            << " total=" << (registered + pending);
+}
+
+void InstanceMgr::log_model_pd_counts() {
+  // Snapshot model managers to minimize lock hold time.
+  std::vector<std::pair<std::string, std::shared_ptr<ModelInstanceMgr>>> mgrs;
+  {
+    std::shared_lock<std::shared_mutex> lock(model_instance_mgr_mutex_);
+    mgrs.reserve(model_instance_mgrs_.size());
+    for (const auto& [model_id, mgr] : model_instance_mgrs_) {
+      mgrs.emplace_back(model_id, mgr);
+    }
+  }
+
+  // Snapshot pool assignments for readable logs.
+  std::unordered_map<std::string, PoolType> pool_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(allocation_mutex_);
+    pool_snapshot = model_pool_assignments_;
+  }
+
+  for (const auto& [model_id, mgr] : mgrs) {
+    if (!mgr) continue;
+    int prefill_count = 0;
+    int decode_count = 0;
+    int normal_count = 0;
+    int64_t heat = mgr->get_model_heat();
+
+    auto all_instances = mgr->get_all_instance_names();
+    for (const auto& inst : all_instances) {
+      auto state = mgr->get_model_state(inst);
+      if (state != ModelState::WAKEUP && state != ModelState::ALLOCATED) {
+        continue;
+      }
+      auto tag = get_instance_tag(inst);
+      if (tag == InstanceTag::DECODE) {
+        ++decode_count;
+      } else if (tag == InstanceTag::PREFILL) {
+        ++prefill_count;
+      } else if (tag == InstanceTag::NORMAL) {
+        ++normal_count;
+      }
+    }
+
+    const auto it = pool_snapshot.find(model_id);
+    const PoolType pool = (it != pool_snapshot.end()) ? it->second : PoolType::NONE;
+    const char* pool_name = "NONE";
+    if (pool == PoolType::STEADY) {
+      pool_name = "STEADY";
+    } else if (pool == PoolType::ELASTIC) {
+      pool_name = "ELASTIC";
+    }
+
+    LOG(INFO) << "Model PD metrics: model=" << model_id
+              << " pool=" << pool_name
+              << " heat=" << heat
+              << " prefill=" << prefill_count
+              << " decode=" << decode_count
+              << " normal=" << normal_count;
   }
 }
 
@@ -307,8 +427,12 @@ void InstanceMgr::fork_master_and_sleep(
       int tmp_port = base_port + node_idx;
       std::string tmp_instance_name = instance_name.substr(0, instance_name.find(":")) +
                                       ":" + std::to_string(tmp_port);
-      std::shared_ptr<brpc::Channel> tmp_channel = cached_channels_[tmp_instance_name];
-
+      std::shared_ptr<brpc::Channel> tmp_channel = get_channel(tmp_instance_name);
+      if (!tmp_channel) {
+        LOG(ERROR) << "Channel not found for " << tmp_instance_name
+                   << ", skipping fork for model " << model_id;
+        continue;
+      }
 
       fork_threads.emplace_back([this, tmp_instance_name, node_idx, fork_body, model_id, tmp_channel, &fork_success_count]() {
         // send fork request
@@ -1221,10 +1345,23 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
     LOG(INFO) << "Model " << model_id << " on " << instance_name
               << " sleep successful. Memory freed will be reflected in next heartbeat.";
 
+    bool instance_idle = false;
     if (count_awake_models_on_instance(instance_name) == 0) {
       std::unique_lock<std::shared_mutex> lock(tag_mutex_);
       instance_tag_map_[instance_name] = InstanceTag::NONE;
       LOG(INFO) << "Tag change: Reset tag for " << instance_name << " to NONE (no awake models)";
+      refresh_elastic_decode_slot_locked(model_id);
+      instance_idle = true;
+    } else {
+      std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+      refresh_elastic_decode_slot_locked(model_id);
+    }
+    if (instance_idle) {
+      // Notify steady pool reclaim waiters.
+      {
+        std::lock_guard<std::mutex> lock2(instance_freed_mutex_);
+      }
+      instance_freed_cv_.notify_all();
     }
   }
 }
@@ -1269,15 +1406,32 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
   if (wakeup_success) {
     LOG(INFO) << "Model " << model_id << " wakeup successful on " << instance_name
               << ". Memory usage will be reflected in next heartbeat.";
+    // Notify cold elastic path waiters.
+    model_wakeup_cv_.notify_all();
   } else {
     LOG(ERROR) << "Failed to wakeup model " << model_id
                << " on " << instance_name;
+    // Roll back allocation state on failure.
+    model_mgr->set_model_state(instance_name, ModelState::SLEEP);
     if (count_awake_models_on_instance(instance_name) == 0) {
       std::unique_lock<std::shared_mutex> lock(tag_mutex_);
       instance_tag_map_[instance_name] = InstanceTag::NONE;
       LOG(INFO) << "Tag change:  Reset tag for " << instance_name
                 << " to NONE (wakeup failed, no awake models)";
+      refresh_elastic_decode_slot_locked(model_id);
+    } else {
+      std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+      refresh_elastic_decode_slot_locked(model_id);
     }
+    {
+      std::lock_guard<std::mutex> lock(allocation_mutex_);
+      elastic_occupied_instances_.erase(instance_name);
+    }
+    // Notify steady pool reclaim waiters that an instance may be freed.
+    {
+      std::lock_guard<std::mutex> lock(instance_freed_mutex_);
+    }
+    instance_freed_cv_.notify_all();
   }
 }
 
@@ -1552,8 +1706,8 @@ bool InstanceMgr::should_accept_scaling_plan(
       }
     }
     if (all_tiny && elapsed_sec < 5.0) {
-      LOG(INFO) << "Anti-jitter: reject (all changes tiny, elapsed="
-                << elapsed_sec << "s < 5s)";
+      // LOG(INFO) << "Anti-jitter: reject (all changes tiny, elapsed="
+      //           << elapsed_sec << "s < 5s)";
       return false;
     }
   }
@@ -1584,8 +1738,8 @@ bool InstanceMgr::should_accept_scaling_plan(
       dot += d_prev * d_next;
     }
     if (dot < 0.0) {
-      LOG(INFO) << "Anti-jitter: reject (direction reversal, dot="
-                << dot << ", elapsed=" << elapsed_sec << "s < 5s)";
+      // LOG(INFO) << "Anti-jitter: reject (direction reversal, dot="
+      //           << dot << ", elapsed=" << elapsed_sec << "s < 5s)";
       return false;
     }
   }
@@ -1608,10 +1762,27 @@ bool InstanceMgr::try_dynamic_part_auto_scaling() {
   return true;
 }
 
+void InstanceMgr::request_cold_elastic_wakeup(const std::string& model_id) {
+  // Signal the auto-scaling thread to run immediately.
+  {
+    std::lock_guard<std::mutex> lock(scaling_trigger_mutex_);
+    scaling_requested_ = true;
+  }
+  scaling_trigger_cv_.notify_one();
+
+  // Wait until model has a WAKEUP instance or timeout (10s).
+  static constexpr int kColdWakeupTimeoutSeconds = 10;
+  auto deadline = std::chrono::steady_clock::now() +
+                  std::chrono::seconds(kColdWakeupTimeoutSeconds);
+  std::unique_lock<std::mutex> lock(model_wakeup_wait_mutex_);
+  model_wakeup_cv_.wait_until(lock, deadline, [this, &model_id] {
+    return get_wakeup_count(model_id) > 0 || exited_;
+  });
+}
+
 void InstanceMgr::dynamic_part_auto_scaling_impl() {
   int32_t total_gpus = total_available_gpus_.load();
-  // Budget: total GPUs minus steady pool reservation
-  int32_t budget = std::max(0, total_gpus - steady_needed_gpus());
+  int32_t raw_budget = std::max(0, total_gpus - steady_needed_gpus());
 
   // 1. Compute per-model GPU targets (elastic pool models only)
   struct ScalingTarget {
@@ -1622,6 +1793,7 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
     std::shared_ptr<ModelInstanceMgr> mgr;
   };
   std::vector<ScalingTarget> targets;
+  int32_t total_elastic_alloc = 0;
 
   {
     std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
@@ -1632,29 +1804,33 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
           pool_it->second != PoolType::ELASTIC) {
         continue;
       }
+      total_elastic_alloc += mgr->get_allocation_count();
 
       ScalingTarget t;
       t.model_id = id;
       t.mgr = mgr;
       t.heat = mgr->get_model_heat();
 
-      if (options_.disable_steady_pool()) {
-        // Steady pool disabled: use fixed instance count or all available
+      if (t.heat == 0) {
+        t.gpu_target = 0;
+      } else if (options_.disable_steady_pool()) {
         int32_t fixed_count = options_.elastic_instance_count();
-        t.gpu_target = (t.heat == 0) ? 0
-            : (fixed_count >= 2) ? fixed_count : budget;
+        t.gpu_target = (fixed_count >= 2) ? fixed_count : raw_budget;
       } else {
-        auto it = model_resource_models_.find(id);
-        t.gpu_target = (t.heat == 0) ? 0
-            : (it != model_resource_models_.end())
-                ? it->second->compute_gpu_target(t.heat, gpu_hw_spec_)
-                : 1;
+        double avg_rate = mgr->get_avg_token_rate(3);
+        t.gpu_target = compute_elastic_gpu_target_from_rate(avg_rate);
       }
 
       t.gpu_allocated = 0;
       targets.push_back(std::move(t));
     }
   }
+
+  // Budget: subtract steady reservation + in-flight DRAINING instances.
+  // DRAINING instances still occupy GPUs but are not counted in allocation_count.
+  int32_t in_flight = static_cast<int32_t>(elastic_occupied_instances_.size()) -
+                      total_elastic_alloc;
+  int32_t budget = std::max(0, raw_budget - std::max(0, in_flight));
 
   // 2. Budget constraint with proportional scaling.
   // gpu_target = number of PREFILL instances needed.  Each active model
@@ -1828,9 +2004,12 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
   }
 
   // Anti-jitter check: compare new plan against previous plans.
+  // Use PREFILL count only (exclude the fixed DECODE instance) so that
+  // the jitter detector tracks the variable part of the allocation.
   ScalingPlan new_plan;
   for (const auto& t : targets) {
-    new_plan[t.model_id] = {t.gpu_allocated, t.heat};
+    int32_t prefill_count = (t.gpu_allocated > 1) ? t.gpu_allocated - 1 : 0;
+    new_plan[t.model_id] = {prefill_count, t.heat};
   }
   if (!should_accept_scaling_plan(new_plan)) {
     return;
@@ -1858,8 +2037,10 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
 
   std::vector<ScaleDownCandidate> scale_down_candidates;
   for (size_t i = 0; i < targets.size(); ++i) {
-    int32_t current_wakeup = targets[i].mgr->get_wakeup_count();
-    int32_t excess = current_wakeup - targets[i].gpu_allocated;
+    // Use allocation_count (ALLOCATED + WAKEUP) to treat in-flight async
+    // wakeups as working instances, preventing unnecessary scale-down.
+    int32_t current_alloc = targets[i].mgr->get_allocation_count();
+    int32_t excess = current_alloc - targets[i].gpu_allocated;
     if (excess <= 0) continue;
     auto unlocked = targets[i].mgr->get_unlocked_instances();
     int32_t added = 0;
@@ -1947,7 +2128,7 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
     targets[down.target_idx].mgr->set_model_state(
         down.instance_name, ModelState::DRAINING);
 
-    // Allocate + wake new model on same instance (synchronous)
+    // Allocate + wake new model on same instance (state bookkeeping synchronous)
     targets[up.target_idx].mgr->set_model_state(
         down.instance_name, ModelState::ALLOCATED);
     deduct_free_pages(down.instance_name,
@@ -1960,7 +2141,12 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
                 << " -> " << instance_tag_name(new_tag)
                 << " (overlapped scale-up for model " << up.model_id << ")";
     }
-    send_model_wakeup(down.instance_name, up.model_id, true);
+    // Async: wakeup new model (HTTP call in separate thread).
+    std::string wake_inst = down.instance_name;
+    std::string wake_model = up.model_id;
+    std::thread([this, wake_inst, wake_model]() {
+      send_model_wakeup(wake_inst, wake_model, true);
+    }).detach();
 
     // Async: drain + sleep old model
     // Instance stays in elastic_occupied_instances_ (new model is using it)
@@ -1975,7 +2161,7 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
     }).detach();
   }
 
-  // Phase D: Execute remaining scale-ups (on free instances)
+  // Phase D: Execute remaining scale-ups (on free instances, async wakeup)
   for (auto& t : targets) {
     int32_t current_alloc = t.mgr->get_allocation_count();
     int32_t deficit = t.gpu_allocated - current_alloc;
@@ -2001,6 +2187,7 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
         continue;
       }
 
+      // Synchronous state bookkeeping.
       t.mgr->set_model_state(inst_name, ModelState::ALLOCATED);
       deduct_free_pages(inst_name, model_size);
       elastic_occupied_instances_.insert(inst_name);
@@ -2012,12 +2199,13 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
                   << " -> " << instance_tag_name(new_tag)
                   << " (elastic scale-up for model " << t.model_id << ")";
       }
-      inst_lock.unlock();
-
-      send_model_wakeup(inst_name, t.model_id, true);  // blocking
+      // Async wakeup (HTTP call in separate thread).
+      std::string wi = inst_name;
+      std::string wm = t.model_id;
+      std::thread([this, wi, wm]() {
+        send_model_wakeup(wi, wm, true);
+      }).detach();
       deficit--;
-
-      if (deficit > 0) inst_lock.lock();
     }
   }
 
@@ -2037,6 +2225,11 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
         std::lock_guard<std::mutex> lock(allocation_mutex_);
         elastic_occupied_instances_.erase(inst);
       }
+      // Notify steady pool reclaim waiters that an instance may be freed.
+      {
+        std::lock_guard<std::mutex> lock(instance_freed_mutex_);
+      }
+      instance_freed_cv_.notify_all();
       promote_prefill_to_decode(model);
     }).detach();
   }
@@ -2045,6 +2238,11 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
   for (auto& t : targets) {
     if (t.gpu_allocated == 0) {
       model_pool_assignments_[t.model_id] = PoolType::NONE;
+      {
+        std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+        clear_elastic_decode_slot_locked(
+            t.model_id, "model removed from ELASTIC pool");
+      }
       LOG(INFO) << "Model " << t.model_id
                 << " heat=0, removed from ELASTIC pool";
     }
@@ -2304,6 +2502,25 @@ int32_t InstanceMgr::steady_needed_gpus() {
       + pending_steady_gpus_;
 }
 
+int32_t InstanceMgr::compute_elastic_gpu_target_from_rate(double avg_token_rate) {
+  if (avg_token_rate <= 0.0) return 1;
+  // Exact capacity data: max token rate for 1..8 instances.
+  static constexpr double kCapacity[] = {
+      3000, 10000, 20000, 30000, 45000, 55000, 65000, 75000};
+  static constexpr int32_t kCapacitySize =
+      static_cast<int32_t>(sizeof(kCapacity) / sizeof(kCapacity[0]));
+  for (int32_t i = 0; i < kCapacitySize; ++i) {
+    if (kCapacity[i] > avg_token_rate) return i + 1;
+  }
+  // Beyond lookup table: extrapolate with linear regression.
+  // Least-squares fit on the 8 data points: f(x) = 10702.38 * x - 10285.71
+  static constexpr double kSlope = 10702.38;
+  static constexpr double kNegIntercept = 10285.71;
+  int32_t b = static_cast<int32_t>(
+      std::ceil((avg_token_rate + kNegIntercept) / kSlope));
+  return std::max(b, kCapacitySize + 1);
+}
+
 ResourceNeeds InstanceMgr::get_model_resource_needs(const std::string& model_id) {
   auto model_mgr = get_model_instance_mgr(model_id);
   int64_t heat = model_mgr ? model_mgr->get_model_heat() : 0;
@@ -2485,22 +2702,33 @@ std::string InstanceMgr::find_or_create_steady_bin(
     }
   }
 
-  // Phase 3: No idle instance — reclaim from elastic pool (BLOCKING)
+  // Phase 3: No idle instance — reclaim from elastic pool (wait with timeout)
   if (!allow_reclaim) {
     return "";
   }
   pending_steady_gpus_ += kTensorParallelSize;
 
-  // Release allocation_mutex_ since dynamic_part_auto_scaling also acquires it
-  // Note: caller must handle this unlock/relock pattern
-  allocation_mutex_.unlock();
-  dynamic_part_auto_scaling();
-  allocation_mutex_.lock();
-
-  pending_steady_gpus_ -= kTensorParallelSize;
-
-  // Retry: find the freed instance
+  // Trigger auto-scaling thread to run immediately (will shrink elastic pool).
   {
+    std::lock_guard<std::mutex> lock(scaling_trigger_mutex_);
+    scaling_requested_ = true;
+  }
+  scaling_trigger_cv_.notify_one();
+
+  // Wait for a NONE-tagged instance to appear (max 10s).
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  std::string found_instance;
+
+  while (found_instance.empty() && std::chrono::steady_clock::now() < deadline) {
+    // Release allocation_mutex_ to let drain threads finish.
+    allocation_mutex_.unlock();
+    {
+      std::unique_lock<std::mutex> wait_lock(instance_freed_mutex_);
+      instance_freed_cv_.wait_for(wait_lock, std::chrono::seconds(1));
+    }
+    allocation_mutex_.lock();
+
+    // Scan for freed instance.
     std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
     for (const auto& [inst_name, _] : instances_) {
       if (get_instance_tag(inst_name) != InstanceTag::NONE) continue;
@@ -2513,14 +2741,18 @@ std::string InstanceMgr::find_or_create_steady_bin(
       new_bin.remaining_bandwidth = gpu_hw_spec_.bandwidth_per_gpu - needs.bandwidth;
       new_bin.models.insert(model_id);
       steady_bins_.push_back(std::move(new_bin));
-
-      LOG(INFO) << "Reclaimed instance " << inst_name << " for steady bin, model "
-                << model_id;
-      return inst_name;
+      found_instance = inst_name;
+      break;
     }
   }
 
-  return "";
+  pending_steady_gpus_ -= kTensorParallelSize;
+
+  if (!found_instance.empty()) {
+    LOG(INFO) << "Reclaimed instance " << found_instance
+              << " for steady bin, model " << model_id;
+  }
+  return found_instance;
 }
 
 std::vector<std::tuple<std::string, std::string, std::string>>
@@ -2642,12 +2874,16 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
     return false;  // still fits in steady pool
   }
 
-  // Don't upgrade if elastic pool can't guarantee at least 2 instances.
-  int32_t elastic_budget =
-      std::max(0, total_available_gpus_.load() - steady_needed_gpus());
-  int32_t elastic_used =
-      static_cast<int32_t>(elastic_occupied_instances_.size());
-  if (elastic_budget - elastic_used < 2) {
+  // Don't upgrade if elastic pool can't guarantee at least 1P1D per model.
+  int32_t steady_gpus = steady_needed_gpus();
+  int32_t elastic_model_count = 0;
+  for (const auto& [mid, pool] : model_pool_assignments_) {
+    if (pool == PoolType::ELASTIC) {
+      ++elastic_model_count;
+    }
+  }
+  if (steady_gpus + (elastic_model_count + 1) * 2 >
+      total_available_gpus_.load()) {
     return false;
   }
 
@@ -2695,6 +2931,11 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
   for (const auto& [mid, old_inst, new_inst] : repack_moves) {
     LOG(INFO) << "R(B) repack: moving model " << mid
               << " from " << old_inst << " to " << new_inst;
+    auto mgr = get_model_instance_mgr(mid);
+    if (mgr) {
+      mgr->set_model_state(new_inst, ModelState::ALLOCATED);
+    }
+    deduct_free_pages(new_inst, get_model_size_bytes(mid));
     {
       std::unique_lock<std::shared_mutex> lock(tag_mutex_);
       instance_tag_map_[new_inst] = InstanceTag::NORMAL;
@@ -2702,7 +2943,6 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
                 << " -> NORMAL (R(B) repack for model " << mid << ")";
     }
     send_model_wakeup(new_inst, mid, false);
-    auto mgr = get_model_instance_mgr(mid);
     if (mgr) mgr->set_model_state(old_inst, ModelState::DRAINING);
     wait_for_model_drain(old_inst, mid);
     send_model_sleep(old_inst, mid);
@@ -2896,6 +3136,11 @@ void InstanceMgr::steady_part_auto_repacking() {
   for (const auto& [model_id, old_inst, new_inst] : moves) {
     LOG(INFO) << "steady_part_auto_repacking: moving model " << model_id
               << " from " << old_inst << " to " << new_inst;
+    auto mgr = get_model_instance_mgr(model_id);
+    if (mgr) {
+      mgr->set_model_state(new_inst, ModelState::ALLOCATED);
+    }
+    deduct_free_pages(new_inst, get_model_size_bytes(model_id));
     {
       std::unique_lock<std::shared_mutex> lock(tag_mutex_);
       instance_tag_map_[new_inst] = InstanceTag::NORMAL;
@@ -2903,7 +3148,6 @@ void InstanceMgr::steady_part_auto_repacking() {
                 << " -> NORMAL (steady repack for model " << model_id << ")";
     }
     send_model_wakeup(new_inst, model_id, false);
-    auto mgr = get_model_instance_mgr(model_id);
     if (mgr) mgr->set_model_state(old_inst, ModelState::DRAINING);
     wait_for_model_drain(old_inst, model_id);
     send_model_sleep(old_inst, model_id);
@@ -3024,6 +3268,11 @@ void InstanceMgr::elastic_to_steady_demotion() {
 
     // Change pool assignment to STEADY
     pool_it->second = PoolType::STEADY;
+    {
+      std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+      clear_elastic_decode_slot_locked(
+          model_id, "model demoted from ELASTIC to STEADY");
+    }
 
     LOG(INFO) << "elastic_to_steady_demotion: demoting model " << model_id
               << " from ELASTIC to STEADY on " << steady_instance
@@ -3114,15 +3363,67 @@ void InstanceMgr::set_instance_tag(const std::string& instance_name,
 }
 
 InstanceTag InstanceMgr::determine_elastic_tag(const std::string& model_id) {
-  auto awake = get_awake_instances(model_id);
-  return awake.empty() ? InstanceTag::DECODE : InstanceTag::PREFILL;
+  std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+  return determine_elastic_tag_locked(model_id);
 }
 
 InstanceTag InstanceMgr::determine_elastic_tag_locked(const std::string& model_id) {
+  // Self-heal stale reservation before making a new decision.
+  refresh_elastic_decode_slot_locked(model_id);
+  const bool reserved_before =
+      (elastic_decode_reserved_models_.count(model_id) > 0);
+  const bool active_decode_slot = has_elastic_decode_slot_locked(model_id);
+  InstanceTag decided_tag = InstanceTag::DECODE;
+  if (reserved_before || active_decode_slot) {
+    elastic_decode_reserved_models_.insert(model_id);
+    decided_tag = InstanceTag::PREFILL;
+  } else {
+    elastic_decode_reserved_models_.insert(model_id);
+    decided_tag = InstanceTag::DECODE;
+  }
+  LOG(INFO) << "Elastic tag decision: model=" << model_id
+            << " reserved_before=" << reserved_before
+            << " active_decode_slot=" << active_decode_slot
+            << " decided=" << instance_tag_name(decided_tag);
+  return decided_tag;
+}
+
+bool InstanceMgr::has_elastic_decode_slot_locked(const std::string& model_id) {
   auto model_mgr = get_model_instance_mgr(model_id);
-  if (!model_mgr) return InstanceTag::DECODE;
-  return model_mgr->get_awake_instances().empty()
-      ? InstanceTag::DECODE : InstanceTag::PREFILL;
+  if (!model_mgr) return false;
+
+  auto all_instances = model_mgr->get_all_instance_names();
+  for (const auto& inst : all_instances) {
+    auto state = model_mgr->get_model_state(inst);
+    if (state != ModelState::WAKEUP && state != ModelState::ALLOCATED) {
+      continue;
+    }
+    auto tag_it = instance_tag_map_.find(inst);
+    if (tag_it != instance_tag_map_.end() &&
+        tag_it->second == InstanceTag::DECODE) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void InstanceMgr::refresh_elastic_decode_slot_locked(const std::string& model_id) {
+  if (elastic_decode_reserved_models_.count(model_id) == 0) {
+    return;
+  }
+  if (has_elastic_decode_slot_locked(model_id)) {
+    return;
+  }
+  clear_elastic_decode_slot_locked(
+      model_id, "no DECODE instance in WAKEUP/ALLOCATED");
+}
+
+void InstanceMgr::clear_elastic_decode_slot_locked(const std::string& model_id,
+                                                   const std::string& reason) {
+  if (elastic_decode_reserved_models_.erase(model_id) > 0) {
+    LOG(INFO) << "Elastic decode reservation reset for model " << model_id
+              << " (" << reason << ")";
+  }
 }
 
 void InstanceMgr::promote_prefill_to_decode(const std::string& model_id) {
@@ -3149,6 +3450,7 @@ void InstanceMgr::promote_prefill_to_decode(const std::string& model_id) {
     if (tag == InstanceTag::PREFILL) {
       std::unique_lock<std::shared_mutex> tag_lock(tag_mutex_);
       instance_tag_map_[inst] = InstanceTag::DECODE;
+      elastic_decode_reserved_models_.insert(model_id);
       LOG(INFO) << "Tag change: Promoted instance " << inst << " from PREFILL to DECODE "
                 << "for model " << model_id;
       return;

@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <brpc/channel.h>
 
+#include <condition_variable>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -44,6 +45,10 @@ class InstanceMgr final {
  public:
 
   const std::vector<std::pair<std::string, std::string>> MODELS = {
+    {"Qwen3-0.6B", "/export/home/models/Qwen3-0.6B"},
+    {"Qwen3-1.7B", "/export/home/models/Qwen3-1.7B"},
+    {"Qwen2.5-3B", "/export/home/models/Qwen3-4B"},
+    {"Qwen3-4B", "/export/home/models/Qwen3-4B"},
     {"Qwen3-8B", "/export/home/models/Qwen3-8B"},
     {"Qwen2-7B", "/export/home/models/Qwen2-7B"}
     // {"Qwen2.5-14B", "/export/home/models/Qwen2.5-14B"},
@@ -127,15 +132,18 @@ class InstanceMgr final {
   void set_instance_tag(const std::string& instance_name, InstanceTag tag);
   bool is_model_waking_up(const std::string& model_id);
 
-  // Trigger per-request auto-scaling. Computes GPU targets for elastic pool models
-  // using resource_model, then directly wakes/sleeps instances.
-  // Scale-up is blocking; scale-down spawns async drain threads.
+  // Trigger auto-scaling. Computes GPU targets for elastic pool models
+  // using resource_model, then wakes/sleeps instances asynchronously.
   // Budget = total_gpus - steady_needed_gpus.
   void dynamic_part_auto_scaling();
 
   // Non-blocking variant: try_lock on allocation_mutex_; if the lock is already
   // held (another scaling in progress), return false immediately without scaling.
   bool try_dynamic_part_auto_scaling();
+
+  // Signal the auto-scaling thread and wait until the model has at least one
+  // WAKEUP instance (or timeout). Used for cold elastic model first-request path.
+  void request_cold_elastic_wakeup(const std::string& model_id);
 
   std::shared_ptr<ModelInstanceMgr> get_model_instance_mgr(const std::string& model_id);
 
@@ -245,6 +253,11 @@ class InstanceMgr final {
   // Get number of GPUs reserved by the steady pool
   int32_t steady_needed_gpus();
 
+  // Compute elastic pool gpu_target from 3-second average token rate.
+  // Uses linear regression on empirical capacity data to find the minimum
+  // instance count whose max throughput exceeds the given rate.
+  int32_t compute_elastic_gpu_target_from_rate(double avg_token_rate);
+
   // Determine the tag for an elastic pool instance: DECODE if the model has no
   // DECODE instance yet, PREFILL otherwise.
   InstanceTag determine_elastic_tag(const std::string& model_id);
@@ -252,6 +265,19 @@ class InstanceMgr final {
   // Same as determine_elastic_tag but reads instance_tag_map_ directly.
   // Must be called while holding tag_mutex_ (avoids re-entrant locking).
   InstanceTag determine_elastic_tag_locked(const std::string& model_id);
+
+  // Returns true when model has at least one DECODE instance in WAKEUP/ALLOCATED.
+  // Must be called while holding tag_mutex_.
+  bool has_elastic_decode_slot_locked(const std::string& model_id);
+
+  // Clear stale decode reservation when the model no longer has a DECODE slot.
+  // Must be called while holding tag_mutex_.
+  void refresh_elastic_decode_slot_locked(const std::string& model_id);
+
+  // Remove decode reservation for a model.
+  // Must be called while holding tag_mutex_.
+  void clear_elastic_decode_slot_locked(const std::string& model_id,
+                                        const std::string& reason);
 
   // If the model is in the elastic pool and has no DECODE instance, promote
   // one of its PREFILL instances to DECODE.
@@ -272,6 +298,12 @@ class InstanceMgr final {
   bool send_http_request(std::shared_ptr<brpc::Channel> channel,
                          const std::string& uri,
                          const std::string& request_body);
+
+  // Periodic low-frequency diagnostics for model P/D allocations.
+  void log_model_pd_counts();
+
+  // Periodic diagnostics for total instance counts (model-independent).
+  void log_instance_counts();
 
  private:
   DISALLOW_COPY_AND_ASSIGN(InstanceMgr);
@@ -413,6 +445,22 @@ class InstanceMgr final {
       elastic_low_demand_since_;
   // Demotion check thread
   std::unique_ptr<std::thread> demotion_thread_;
+  // Low-frequency model P/D metrics thread
+  std::unique_ptr<std::thread> pd_metrics_thread_;
+
+  // Dedicated auto-scaling thread (replaces per-request triggering)
+  std::unique_ptr<std::thread> auto_scaling_thread_;
+  std::mutex scaling_trigger_mutex_;
+  std::condition_variable scaling_trigger_cv_;
+  bool scaling_requested_ = false;
+
+  // Condition variable for cold elastic path: signaled when a model wakeup completes
+  std::mutex model_wakeup_wait_mutex_;
+  std::condition_variable model_wakeup_cv_;
+
+  // Condition variable for steady pool reclaim: signaled when an instance is freed
+  std::mutex instance_freed_mutex_;
+  std::condition_variable instance_freed_cv_;
 
   // XTensor memory info per instance
   std::mutex xtensor_info_mutex_;
@@ -425,6 +473,9 @@ class InstanceMgr final {
   // MixPD instance role tags
   mutable std::shared_mutex tag_mutex_;
   std::unordered_map<std::string, InstanceTag> instance_tag_map_;
+  // Model-level decode reservation for elastic pool.
+  // Prevents concurrent scale-up loops from assigning multiple DECODE tags.
+  std::unordered_set<std::string> elastic_decode_reserved_models_;
 
   ThreadPool threadpool_;
 };

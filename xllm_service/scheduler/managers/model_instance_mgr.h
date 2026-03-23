@@ -96,6 +96,7 @@ class ModelInstanceMgr {
 
   void update_model_heat(int64_t token_count);
   int64_t get_model_heat();
+  double get_avg_token_rate(int window_seconds);
 
   std::shared_mutex* get_instance_state_single_mutex(const std::string& instance_name);
 
