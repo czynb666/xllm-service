@@ -184,6 +184,9 @@ void Scheduler::process_request_queue(const std::string& model_name) {
         LOG(WARNING) << "LB policy failed to assign instance for steady request "
                      << request->service_request_id
                      << " model=" << request->model;
+        if (request->timeout_callback) {
+          request->timeout_callback();
+        }
         continue;
       }
     } else {
@@ -198,13 +201,20 @@ void Scheduler::process_request_queue(const std::string& model_name) {
         auto awake = instance_mgr_->get_awake_prefill_instances(request->model);
         if (awake.empty()) {
           LOG(ERROR) << "request_cold_elastic_wakeup failed to wake model " << request->model
-                     << " (request silently dropped!)";
+                     << ", returning 503 to client";
+          if (request->timeout_callback) {
+            request->timeout_callback();
+          }
           continue;
         }
         request->routing.prefill_name = awake[0];
         auto decode_instances = instance_mgr_->get_awake_decode_instances(request->model);
         if (decode_instances.empty()) {
-          LOG(ERROR) << "No awake decode instances found for model " << request->model;
+          LOG(ERROR) << "No awake decode instances found for model " << request->model
+                     << ", returning 503 to client";
+          if (request->timeout_callback) {
+            request->timeout_callback();
+          }
           continue;
         }
         request->routing.decode_name = decode_instances[0];
@@ -215,6 +225,9 @@ void Scheduler::process_request_queue(const std::string& model_name) {
           LOG(WARNING) << "LB policy failed to assign instance for request "
                        << request->service_request_id
                        << " model=" << request->model;
+          if (request->timeout_callback) {
+            request->timeout_callback();
+          }
           continue;
         }
       }

@@ -140,9 +140,9 @@ class StreamCallData : public CallData {
       controller_->http_response().set_status_code(http_status_code);
       controller_->SetFailed(error_message);
     } else {
-      io_buf_.clear();
-      io_buf_.append(error_message);
-      pa_->Write(io_buf_);
+      butil::IOBuf buf;
+      buf.append(error_message);
+      pa_->Write(buf);
     }
 
     return true;
@@ -162,9 +162,9 @@ class StreamCallData : public CallData {
   // For stream response
   bool write(const std::string& attachment) {
     if (trace_callback_) trace_callback_(attachment);
-    io_buf_.clear();
-    io_buf_.append(attachment);
-    pa_->Write(io_buf_);
+    butil::IOBuf buf;
+    buf.append(attachment);
+    pa_->Write(buf);
     if (attachment.find("data: [DONE]") != std::string::npos) {
       finished_ = true;
     }
@@ -173,32 +173,32 @@ class StreamCallData : public CallData {
   }
 
   bool write(Response& response) {
-    io_buf_.clear();
-    io_buf_.append("data: ");
-    butil::IOBufAsZeroCopyOutputStream json_output(&io_buf_);
+    butil::IOBuf buf;
+    buf.append("data: ");
+    butil::IOBufAsZeroCopyOutputStream json_output(&buf);
     std::string err_msg;
     if (!json2pb::ProtoMessageToJson(
             response, &json_output, json_options_, &err_msg)) {
       LOG(ERROR) << "Failed to convert proto to json: " << err_msg;
       return false;
     }
-    io_buf_.append("\n\n");
+    buf.append("\n\n");
 
     if (trace_callback_) {
       std::string str;
-      io_buf_.copy_to(&str);
+      buf.copy_to(&str);
       trace_callback_(str);
     }
 
-    pa_->Write(io_buf_);
+    pa_->Write(buf);
     return true;
   }
 
   bool finish() {
-    io_buf_.clear();
-    io_buf_.append("data: [DONE]\n\n");
+    butil::IOBuf buf;
+    buf.append("data: [DONE]\n\n");
 
-    pa_->Write(io_buf_);
+    pa_->Write(buf);
     return true;
   }
 
@@ -214,7 +214,6 @@ class StreamCallData : public CallData {
 
   bool stream_ = false;
   butil::intrusive_ptr<brpc::ProgressiveAttachment> pa_;
-  butil::IOBuf io_buf_;
 
   bool finished_ = false;
   json2pb::Pb2JsonOptions json_options_;

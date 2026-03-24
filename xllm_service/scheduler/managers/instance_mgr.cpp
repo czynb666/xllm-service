@@ -1346,7 +1346,7 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
               << " sleep successful. Memory freed will be reflected in next heartbeat.";
 
     bool instance_idle = false;
-    if (count_awake_models_on_instance(instance_name) == 0) {
+    if (count_active_models_on_instance(instance_name) == 0) {
       std::unique_lock<std::shared_mutex> lock(tag_mutex_);
       instance_tag_map_[instance_name] = InstanceTag::NONE;
       LOG(INFO) << "Tag change: Reset tag for " << instance_name << " to NONE (no awake models)";
@@ -1413,7 +1413,7 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
                << " on " << instance_name;
     // Roll back allocation state on failure.
     model_mgr->set_model_state(instance_name, ModelState::SLEEP);
-    if (count_awake_models_on_instance(instance_name) == 0) {
+    if (count_active_models_on_instance(instance_name) == 0) {
       std::unique_lock<std::shared_mutex> lock(tag_mutex_);
       instance_tag_map_[instance_name] = InstanceTag::NONE;
       LOG(INFO) << "Tag change:  Reset tag for " << instance_name
@@ -1813,9 +1813,6 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
 
       if (t.heat == 0) {
         t.gpu_target = 0;
-      } else if (options_.disable_steady_pool()) {
-        int32_t fixed_count = options_.elastic_instance_count();
-        t.gpu_target = (fixed_count >= 2) ? fixed_count : raw_budget;
       } else {
         double avg_rate = mgr->get_avg_token_rate(3);
         t.gpu_target = compute_elastic_gpu_target_from_rate(avg_rate);
@@ -2234,7 +2231,7 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
     }).detach();
   }
 
-  // Cleanup: if heat → 0, remove from pool
+  // Cleanup: if heat → 0, remove from pool and drain+sleep remaining instances
   for (auto& t : targets) {
     if (t.gpu_allocated == 0) {
       model_pool_assignments_[t.model_id] = PoolType::NONE;
@@ -2245,6 +2242,31 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
       }
       LOG(INFO) << "Model " << t.model_id
                 << " heat=0, removed from ELASTIC pool";
+
+      // Drain+sleep all instances still active (WAKEUP or ALLOCATED).
+      // Using get_active_instances() to also catch in-flight wakeups that
+      // haven't completed yet, preventing leaked instances.
+      auto awake_instances = t.mgr->get_active_instances();
+      for (const auto& inst_name : awake_instances) {
+        t.mgr->set_model_state(inst_name, ModelState::DRAINING);
+        std::string inst = inst_name;
+        std::string model = t.model_id;
+        std::thread([this, inst, model]() {
+          if (!wait_for_model_drain(inst, model)) return;
+          auto mgr = get_model_instance_mgr(model);
+          if (mgr && !mgr->can_sleep(inst)) return;
+          send_model_sleep(inst, model);
+          {
+            std::lock_guard<std::mutex> lock(allocation_mutex_);
+            elastic_occupied_instances_.erase(inst);
+          }
+          {
+            std::lock_guard<std::mutex> lock(instance_freed_mutex_);
+          }
+          instance_freed_cv_.notify_all();
+          promote_prefill_to_decode(model);
+        }).detach();
+      }
     }
   }
 }
@@ -3345,6 +3367,21 @@ int InstanceMgr::count_awake_models_on_instance(const std::string& instance_name
   return count;
 }
 
+int InstanceMgr::count_active_models_on_instance(const std::string& instance_name) {
+  int count = 0;
+  std::shared_lock<std::shared_mutex> lock(model_instance_mgr_mutex_);
+  for (const auto& [model_id, mgr] : model_instance_mgrs_) {
+    auto active = mgr->get_active_instances();
+    for (const auto& inst : active) {
+      if (inst == instance_name) {
+        ++count;
+        break;
+      }
+    }
+  }
+  return count;
+}
+
 InstanceTag InstanceMgr::get_instance_tag(const std::string& instance_name) const {
   std::shared_lock<std::shared_mutex> lock(tag_mutex_);
   auto it = instance_tag_map_.find(instance_name);
@@ -3436,20 +3473,27 @@ void InstanceMgr::promote_prefill_to_decode(const std::string& model_id) {
     }
   }
 
-  auto decode_instances = get_awake_decode_instances(model_id);
-  if (!decode_instances.empty()) {
-    return;
-  }
-
   auto model_mgr = get_model_instance_mgr(model_id);
   if (!model_mgr) return;
 
+  // Hold tag_mutex_ across check-and-promote to prevent two concurrent
+  // drain threads from both promoting a PREFILL → DECODE.
+  std::unique_lock<std::shared_mutex> tag_lock(tag_mutex_);
+
+  // Check if a DECODE instance already exists (under lock).
   auto awake = model_mgr->get_awake_instances();
   for (const auto& inst : awake) {
-    auto tag = get_instance_tag(inst);
-    if (tag == InstanceTag::PREFILL) {
-      std::unique_lock<std::shared_mutex> tag_lock(tag_mutex_);
-      instance_tag_map_[inst] = InstanceTag::DECODE;
+    auto it = instance_tag_map_.find(inst);
+    if (it != instance_tag_map_.end() && it->second == InstanceTag::DECODE) {
+      return;  // Already has DECODE, nothing to do.
+    }
+  }
+
+  // Promote first PREFILL to DECODE.
+  for (const auto& inst : awake) {
+    auto it = instance_tag_map_.find(inst);
+    if (it != instance_tag_map_.end() && it->second == InstanceTag::PREFILL) {
+      it->second = InstanceTag::DECODE;
       elastic_decode_reserved_models_.insert(model_id);
       LOG(INFO) << "Tag change: Promoted instance " << inst << " from PREFILL to DECODE "
                 << "for model " << model_id;

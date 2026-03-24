@@ -1,9 +1,7 @@
-"""SLO Scale Sensitivity Test with Tidal Traffic Pattern.
+"""SLO Scale Sensitivity Test with Tidal Traffic Pattern (single-scale).
 
-Combines:
-  - SLO testing (from slo_test.py): Poisson arrivals, Zipf prompt lengths
-  - Tidal traffic (from tidal_two_test.py): sinusoidal model popularity shifts
-  - SLO Scale sweep: run multiple SLO scales, measure attainment at each
+Runs ONE slo_scale value per invocation (to allow cooldown between runs).
+Generates a JSON result file named: slo_scale_{scale}_{algorithm_name}.json
 
 SLO Definition (AlpaServe-style):
   - TTFT SLO:  ttft <= ttft_slo
@@ -13,12 +11,10 @@ SLO Definition (AlpaServe-style):
   - E2E SLO:  TTFT met AND all per-token deadlines met
   - TPOT attainment:  fraction of tokens (across all requests) meeting deadline(i)
 
-For 实验设计.md 图10: SLO Scale (x-axis) vs SLO Attainment % (y-axis).
-
 Usage:
-    python slo_scale_test.py --url http://127.0.0.1:27888/v1/completions
+    python slo_scale_test.py --slo-scale 1.0 --algorithm-name xllm
+    python slo_scale_test.py --slo-scale 2.0 --algorithm-name alpaserve --url http://...
     python slo_scale_test.py --dry-run
-    python slo_scale_test.py --slo-scales 1.5 2.0 3.0 5.0 --base-tpot-slo 50
 """
 
 import argparse
@@ -27,12 +23,12 @@ import json
 import math
 import os
 import random
+import socket
 import threading
 import time
-import urllib.error
-import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
 # Set no_proxy to bypass proxies for local connections
 os.environ['no_proxy'] = '*'
@@ -41,17 +37,18 @@ os.environ['no_proxy'] = '*'
 
 # Service
 URL = "http://127.0.0.1:27888/v1/completions"
-MODELS = ["Qwen3-8B", "Qwen2-7B"]
+MODELS = ["Qwen3-8B", "Qwen2-7B", "Qwen3-4B"]
 
 # SLO
-SLO_SCALES = [1.5, 2.0, 3.0, 5.0]
-BASE_TTFT_SLO_INTERCEPT_MS = 100   # base_ttft_slo = INTERCEPT + SLOPE * prompt_tokens
-BASE_TTFT_SLO_SLOPE_MS = 0.2       # ms per input token
+SLO_SCALE = 1.0
+ALGORITHM_NAME = "xllm"
+BASE_TTFT_SLO_INTERCEPT_MS = 500   # base_ttft_slo = INTERCEPT + SLOPE * prompt_tokens
+BASE_TTFT_SLO_SLOPE_MS = 0.6       # ms per input token
 BASE_TPOT_SLO_MS = 50              # Base TPOT SLO in ms (before scaling)
-MAX_OUTPUT_TOKENS = 50              # Output tokens per request (for TPOT measurement)
+MAX_OUTPUT_TOKENS = 20              # Output tokens per request (for TPOT measurement)
 
 # Traffic
-AVG_TOKENS_PER_SECOND = 15000  # Target average input token throughput
+AVG_TOKENS_PER_SECOND = 50000  # Target average input token throughput
 TOTAL_REQUESTS = 300
 MAX_WORKERS = 200
 REQUEST_TIMEOUT_S = 120        # Per-request timeout in seconds
@@ -168,61 +165,155 @@ def generate_tidal_sequence(total, models, cycles=1.5, amplitude=0.4):
     return sequence
 
 
-# ── Streaming Request Sender ──────────────────────────────────────────────────
+# ── Streaming Request Sender (raw socket for accurate per-token timing) ──────
 
 def send_request_stream(url, model, prompt_tokens, max_tokens, ttft_slo_ms, req_id):
-    """Send a streaming request, parse SSE to measure TTFT and TPOT.
+    """Send a streaming request via raw socket, parse SSE for TTFT and TPOT.
+
+    Uses raw socket instead of urllib to avoid BufferedReader's 8KB buffer
+    which coalesces all SSE events into a single read, making per-token
+    timestamps useless.
 
     Returns (status, ttft_s, total_latency_s, output_tokens).
-      status: 'ok' or 'fail'
-      ttft_s: time-to-first-token in seconds
-      total_latency_s: time from request start to last token
-      output_tokens: number of tokens received
     """
+    parsed = urlparse(url)
+    host = parsed.hostname
+    port = parsed.port or 80
+
     prompt = "hello xllm " * (prompt_tokens // 4 + 1)
-    payload = {
+    body = json.dumps({
         "model": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": 0,
         "stream": True,
         "ttft_slo": int(ttft_slo_ms),
-    }
-    data = json.dumps(payload).encode('utf-8')
-    headers = {"Content-Type": "application/json"}
-    req = urllib.request.Request(url, data=data, headers=headers)
+    }).encode('utf-8')
+
+    http_req = (
+        f"POST {parsed.path} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"\r\n"
+    ).encode('utf-8') + body
 
     start = time.time()
+    sock = None
     try:
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as response:
-            ttft_time = None
-            last_token_time = None
-            token_count = 0
+        sock = socket.create_connection((host, port), timeout=REQUEST_TIMEOUT_S)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.sendall(http_req)
 
-            for raw_line in response:
+        # ── Read HTTP response headers ──
+        header_buf = b''
+        while b'\r\n\r\n' not in header_buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("connection closed before headers")
+            header_buf += chunk
+
+        header_end = header_buf.index(b'\r\n\r\n') + 4
+        status_line = header_buf[:header_buf.index(b'\r\n')].decode()
+        if ' 200 ' not in status_line:
+            print(f"[#{req_id}][{model}] HTTP error: {status_line}")
+            return 'fail', 0, time.time() - start, 0
+
+        is_chunked = b'transfer-encoding: chunked' in header_buf[:header_end].lower()
+        remaining = header_buf[header_end:]
+
+        # ── SSE event processing ──
+        ttft_time = None
+        last_token_time = None
+        token_count = 0
+        line_buf = b''
+        done = False
+
+        def process_data(data):
+            nonlocal ttft_time, last_token_time, token_count, line_buf, done
+            line_buf += data
+            while b'\n' in line_buf and not done:
+                raw_line, line_buf = line_buf.split(b'\n', 1)
                 line = raw_line.decode('utf-8', errors='replace').strip()
                 if not line or not line.startswith('data:'):
                     continue
                 payload_str = line[5:].strip()
                 if payload_str == '[DONE]':
-                    break
+                    done = True
+                    return
                 token_count += 1
                 now = time.time()
                 if token_count == 1:
                     ttft_time = now
                 last_token_time = now
 
-            if ttft_time is None or token_count == 0:
-                print(f"[#{req_id}][{model}] InTokens: {prompt_tokens}, FAIL: no tokens received")
-                return 'fail', 0, time.time() - start, 0
+        # ── Read body (chunked or identity) ──
+        if is_chunked:
+            chunk_buf = remaining
+            while not done:
+                # Read until we have a chunk header line
+                while b'\r\n' not in chunk_buf:
+                    data = sock.recv(4096)
+                    if not data:
+                        done = True
+                        break
+                    chunk_buf += data
+                if done:
+                    break
 
-            ttft_s = ttft_time - start
-            total_latency_s = last_token_time - start
-            return 'ok', ttft_s, total_latency_s, token_count
+                crlf_pos = chunk_buf.index(b'\r\n')
+                try:
+                    chunk_size = int(chunk_buf[:crlf_pos].strip(), 16)
+                except ValueError:
+                    break
+                chunk_buf = chunk_buf[crlf_pos + 2:]
+
+                if chunk_size == 0:
+                    break  # last chunk
+
+                # Read full chunk body + trailing \r\n
+                needed = chunk_size + 2
+                while len(chunk_buf) < needed:
+                    data = sock.recv(4096)
+                    if not data:
+                        done = True
+                        break
+                    chunk_buf += data
+                if done:
+                    break
+
+                process_data(chunk_buf[:chunk_size])
+                chunk_buf = chunk_buf[needed:]
+        else:
+            # Identity encoding: read until [DONE] or connection close
+            process_data(remaining)
+            while not done:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                process_data(data)
+
+        sock.close()
+        sock = None
+
+        if ttft_time is None or token_count == 0:
+            print(f"[#{req_id}][{model}] InTokens: {prompt_tokens}, "
+                  f"FAIL: no tokens received")
+            return 'fail', 0, time.time() - start, 0
+
+        ttft_s = ttft_time - start
+        total_latency_s = last_token_time - start
+        return 'ok', ttft_s, total_latency_s, token_count
 
     except Exception as e:
         print(f"[#{req_id}][{model}] InTokens: {prompt_tokens}, FAIL: {e}")
         return 'fail', 0, time.time() - start, 0
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 # ── Single Scale Test ─────────────────────────────────────────────────────────
@@ -376,126 +467,19 @@ def run_single_scale(url, slo_scale, model_sequence, prompt_lengths,
     }
 
 
-# ── Plotting ──────────────────────────────────────────────────────────────────
-
-def plot_slo_scale(results, output_dir):
-    """Plot 图10: SLO Scale vs SLO Attainment (TTFT / TPOT / E2E)."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    scales = sorted(results.keys())
-    e2e = [results[s]['e2e_attainment'] for s in scales]
-    ttft = [results[s]['ttft_attainment'] for s in scales]
-    tpot = [results[s]['tpot_attainment'] for s in scales]
-
-    plt.figure(figsize=(8, 5))
-    plt.plot(scales, e2e, 's-', linewidth=2.5, markersize=8,
-             color='#2196F3', label='E2E SLO Attainment')
-    plt.plot(scales, ttft, 'o--', linewidth=1.5, markersize=6,
-             color='#4CAF50', label='TTFT SLO Attainment')
-    plt.plot(scales, tpot, '^--', linewidth=1.5, markersize=6,
-             color='#FF9800', label='TPOT SLO Attainment')
-    plt.xlabel('SLO Scale', fontsize=12)
-    plt.ylabel('SLO Attainment (%)', fontsize=12)
-    plt.title('SLO Scale Sensitivity (Tidal Traffic)', fontsize=14)
-    plt.xticks(scales, [f'{s}x' for s in scales])
-    plt.ylim(0, 105)
-    plt.grid(True, linestyle='--', alpha=0.5)
-    plt.legend(fontsize=11)
-    plt.tight_layout()
-
-    path = os.path.join(output_dir, 'slo_scale_sensitivity.png')
-    plt.savefig(path, dpi=150)
-    plt.close()
-    print(f"Saved {path}")
-
-
-def plot_slo_scale_per_model(results, models, output_dir):
-    """Plot per-model E2E SLO attainment across scales."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    scales = sorted(results.keys())
-    colors = ['#2196F3', '#FF5722', '#4CAF50', '#FFC107', '#9C27B0']
-
-    plt.figure(figsize=(8, 5))
-    for idx, model in enumerate(models):
-        att = [results[s]['per_model_e2e'].get(model, 0) for s in scales]
-        plt.plot(scales, att, 'o--', linewidth=1.5, markersize=6,
-                 color=colors[idx % len(colors)], label=model)
-
-    overall = [results[s]['e2e_attainment'] for s in scales]
-    plt.plot(scales, overall, 's-', linewidth=2.5, markersize=8,
-             color='black', label='Overall')
-
-    plt.xlabel('SLO Scale', fontsize=12)
-    plt.ylabel('E2E SLO Attainment (%)', fontsize=12)
-    plt.title('Per-Model E2E SLO Attainment vs SLO Scale', fontsize=14)
-    plt.xticks(scales, [f'{s}x' for s in scales])
-    plt.ylim(0, 105)
-    plt.grid(True, linestyle='--', alpha=0.5)
-    plt.legend(fontsize=10)
-    plt.tight_layout()
-
-    path = os.path.join(output_dir, 'slo_scale_per_model.png')
-    plt.savefig(path, dpi=150)
-    plt.close()
-    print(f"Saved {path}")
-
-
-def plot_tidal_pattern(model_sequence, models, output_dir):
-    """Visualize the tidal traffic pattern."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    # Sliding-window model fraction
-    window = max(1, len(model_sequence) // 50)
-    x_vals = []
-    model_fracs = {m: [] for m in models}
-
-    for start in range(0, len(model_sequence), window):
-        chunk = model_sequence[start:start + window]
-        x_vals.append(start + window // 2)
-        counts = defaultdict(int)
-        for m in chunk:
-            counts[m] += 1
-        for m in models:
-            model_fracs[m].append(counts[m] / len(chunk))
-
-    colors = ['#2196F3', '#FF5722', '#4CAF50', '#FFC107', '#9C27B0']
-    plt.figure(figsize=(10, 4))
-    for idx, m in enumerate(models):
-        plt.plot(x_vals, model_fracs[m], label=m, linewidth=2,
-                 color=colors[idx % len(colors)])
-
-    plt.xlabel('Request Index', fontsize=12)
-    plt.ylabel('Model Fraction', fontsize=12)
-    plt.title('Tidal Traffic Pattern', fontsize=14)
-    plt.legend(fontsize=11)
-    plt.ylim(0, 1.05)
-    plt.grid(True, linestyle='--', alpha=0.5)
-    plt.tight_layout()
-
-    path = os.path.join(output_dir, 'tidal_traffic_pattern.png')
-    plt.savefig(path, dpi=150)
-    plt.close()
-    print(f"Saved {path}")
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description='SLO Scale Sensitivity Test with Tidal Traffic (图10)')
+        description='SLO Scale Sensitivity Test (single-scale per run)')
     parser.add_argument('--url', type=str, default=URL,
                         help='Service URL (default: %(default)s)')
     parser.add_argument('--models', nargs='+', default=MODELS,
                         help='Model names (default: %(default)s)')
-    parser.add_argument('--slo-scales', nargs='+', type=float, default=SLO_SCALES,
-                        help='SLO scale factors to test (default: %(default)s)')
+    parser.add_argument('--slo-scale', type=float, default=SLO_SCALE,
+                        help='SLO scale factor (default: %(default)s)')
+    parser.add_argument('--algorithm-name', type=str, default=ALGORITHM_NAME,
+                        help='Algorithm name for result file (default: %(default)s)')
     parser.add_argument('--max-tokens', type=int, default=MAX_OUTPUT_TOKENS,
                         help='Max output tokens per request (default: %(default)s)')
     parser.add_argument('--base-tpot-slo', type=float, default=BASE_TPOT_SLO_MS,
@@ -514,59 +498,52 @@ def main():
     parser.add_argument('--output-dir', type=str, default='.',
                         help='Directory for output files (default: cwd)')
     parser.add_argument('--dry-run', action='store_true',
-                        help='Only visualize tidal pattern, skip requests')
+                        help='Print config and exit, skip requests')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print("SLO Scale Sensitivity Test with Tidal Traffic")
+    print("SLO Scale Sensitivity Test (single-scale)")
+    print(f"  Algorithm:       {args.algorithm_name}")
     print(f"  Models:          {args.models}")
-    print(f"  SLO Scales:      {args.slo_scales}")
+    print(f"  SLO Scale:       {args.slo_scale}")
     print(f"  Max output tok:  {args.max_tokens}")
     print(f"  Base TPOT SLO:   {args.base_tpot_slo}ms")
-    print(f"  Requests/scale:  {args.total_requests}")
+    print(f"  Requests:        {args.total_requests}")
     print(f"  Token rate:      {args.avg_tokens_per_second} tokens/s")
     print(f"  Tidal cycles:    {args.tidal_cycles}, amplitude: {args.tidal_amplitude}")
 
-    # Pre-generate tidal model sequence & prompt lengths (shared across scales)
+    # Pre-generate tidal model sequence & prompt lengths
     random.seed(SEED_SEQUENCE)
     model_sequence = generate_tidal_sequence(
         args.total_requests, args.models,
         args.tidal_cycles, args.tidal_amplitude)
     prompt_lengths = [generate_zipf_prompt_len() for _ in range(args.total_requests)]
 
-    # Print distribution
     dist = defaultdict(int)
     for m in model_sequence:
         dist[m] += 1
     print(f"  Model dist:      {dict(dist)}")
 
-    # Always plot tidal pattern
-    plot_tidal_pattern(model_sequence, args.models, args.output_dir)
-
     if args.dry_run:
         print("\nDry-run mode -- skipping actual requests.")
         return
 
-    # Run each SLO scale
-    results = {}
-    for scale in sorted(args.slo_scales):
-        results[scale] = run_single_scale(
-            args.url, scale, model_sequence, prompt_lengths,
-            args.avg_tokens_per_second, args.max_workers,
-            args.max_tokens, args.base_tpot_slo)
+    # Run single scale
+    result = run_single_scale(
+        args.url, args.slo_scale, model_sequence, prompt_lengths,
+        args.avg_tokens_per_second, args.max_workers,
+        args.max_tokens, args.base_tpot_slo)
 
-    # Generate plots
-    plot_slo_scale(results, args.output_dir)
-    plot_slo_scale_per_model(results, args.models, args.output_dir)
-
-    # Save results to JSON
-    json_path = os.path.join(args.output_dir, 'slo_scale_results.json')
+    # Save results to JSON with slo_scale and algorithm_name in filename
+    filename = f"slo_scale_{args.slo_scale}_{args.algorithm_name}.json"
+    json_path = os.path.join(args.output_dir, filename)
     with open(json_path, 'w') as f:
         json.dump({
             'config': {
+                'algorithm_name': args.algorithm_name,
+                'slo_scale': args.slo_scale,
                 'models': args.models,
-                'slo_scales': args.slo_scales,
                 'max_tokens': args.max_tokens,
                 'base_tpot_slo_ms': args.base_tpot_slo,
                 'total_requests': args.total_requests,
@@ -574,23 +551,9 @@ def main():
                 'tidal_cycles': args.tidal_cycles,
                 'tidal_amplitude': args.tidal_amplitude,
             },
-            'results': {str(k): v for k, v in results.items()}
+            'result': result,
         }, f, indent=2)
-    print(f"Saved {json_path}")
-
-    # Summary table
-    scales = sorted(results.keys())
-    print(f"\n{'='*80}")
-    print(f"{'Scale':<8} {'TTFT Att.':<12} {'TPOT Att.':<12} {'E2E Att.':<12} "
-          f"{'Completed':<12} {'Failed':<8}")
-    print(f"{'-'*80}")
-    for s in scales:
-        r = results[s]
-        print(f"{s:<8.1f}x{r['ttft_attainment']:<11.1f}% "
-              f"{r['tpot_attainment']:<11.1f}% "
-              f"{r['e2e_attainment']:<11.1f}% "
-              f"{r['completed']:<12} {r['failed']:<8}")
-    print(f"{'='*80}")
+    print(f"\nSaved {json_path}")
 
 
 if __name__ == "__main__":

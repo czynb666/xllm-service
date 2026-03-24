@@ -128,6 +128,8 @@ class InstanceMgr final {
   std::vector<std::string> get_awake_prefill_instances(const std::string& model_id);
   std::vector<std::string> get_awake_decode_instances(const std::string& model_id);
   int count_awake_models_on_instance(const std::string& instance_name);
+  // Count models with WAKEUP or ALLOCATED state on an instance (includes in-flight wakeups)
+  int count_active_models_on_instance(const std::string& instance_name);
   InstanceTag get_instance_tag(const std::string& instance_name) const;
   void set_instance_tag(const std::string& instance_name, InstanceTag tag);
   bool is_model_waking_up(const std::string& model_id);
