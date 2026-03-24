@@ -140,7 +140,8 @@ std::vector<std::string> ModelInstanceMgr::get_decode_list() const {
 
 bool ModelInstanceMgr::send_http_request(std::shared_ptr<brpc::Channel> channel,
                                          const std::string& uri,
-                                         const std::string& request_body) {
+                                         const std::string& request_body,
+                                         std::string* error_text) {
   brpc::Controller cntl;
   cntl.http_request().uri() = uri;  // brpc channel already has host:port
   cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
@@ -151,6 +152,9 @@ bool ModelInstanceMgr::send_http_request(std::shared_ptr<brpc::Channel> channel,
 
   if (cntl.Failed()) {
     LOG(ERROR) << "HTTP request failed: " << cntl.ErrorText();
+    if (error_text) {
+      *error_text = cntl.ErrorText();
+    }
     return false;
   }
   return true;
@@ -205,15 +209,23 @@ bool ModelInstanceMgr::send_model_wakeup(const std::string& instance_name, std::
   wakeup_body["master_status"] = 0;
 
   // TODO: add retries
-  if (send_http_request(channel, "/wakeup", wakeup_body.dump())) {
+  std::string error_text;
+  if (send_http_request(channel, "/wakeup", wakeup_body.dump(), &error_text)) {
     LOG(INFO) << "Model " << model_id_ << " on " << instance_name
               << " trigger wakeup (H2D) success.";
     set_model_state(instance_name, ModelState::WAKEUP);
     return true;
   } else {
+    // "already awake" means the model is actually running — treat as success
+    if (error_text.find("already awake") != std::string::npos) {
+      LOG(WARNING) << "Model " << model_id_ << " on " << instance_name
+                   << " is already awake, treating as wakeup success.";
+      set_model_state(instance_name, ModelState::WAKEUP);
+      return true;
+    }
     LOG(ERROR) << "Failed to wakeup model " << model_id_
                << " on " << instance_name;
-    set_model_state(instance_name, ModelState::SLEEP);// or revert to ALLOCATED?
+    set_model_state(instance_name, ModelState::SLEEP);
     return false;
   }
 
@@ -267,12 +279,20 @@ bool ModelInstanceMgr::send_model_wakeup_d2d(const std::string& instance_name,
             << " with " << d2d_info.remote_addrs.size() << " remote addrs";
 
   // TODO: add retries
-  if (send_http_request(channel, "/wakeup", wakeup_body.dump())) {
+  std::string error_text;
+  if (send_http_request(channel, "/wakeup", wakeup_body.dump(), &error_text)) {
     LOG(INFO) << "Model " << model_id_ << " on " << instance_name
               << " trigger wakeup (D2D) success.";
     set_model_state(instance_name, ModelState::WAKEUP);
     return true;
   } else {
+    // "already awake" means the model is actually running — treat as success
+    if (error_text.find("already awake") != std::string::npos) {
+      LOG(WARNING) << "Model " << model_id_ << " on " << instance_name
+                   << " is already awake, treating as D2D wakeup success.";
+      set_model_state(instance_name, ModelState::WAKEUP);
+      return true;
+    }
     LOG(ERROR) << "Failed to wakeup model " << model_id_
                << " on " << instance_name << " with D2D transfer";
     set_model_state(instance_name, ModelState::SLEEP);
@@ -440,6 +460,17 @@ std::vector<std::string> ModelInstanceMgr::get_awake_instances() {
     }
   }
   return awake_instances;
+}
+
+std::vector<std::string> ModelInstanceMgr::get_active_instances() {
+  std::shared_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
+  std::vector<std::string> active;
+  for (const auto& pair : instance_states_) {
+    if (pair.second == ModelState::WAKEUP || pair.second == ModelState::ALLOCATED) {
+      active.push_back(pair.first);
+    }
+  }
+  return active;
 }
 
 std::vector<std::string> ModelInstanceMgr::get_all_instance_names() {

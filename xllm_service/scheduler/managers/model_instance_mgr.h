@@ -64,6 +64,8 @@ class ModelInstanceMgr {
   int32_t get_wakeup_count();
   int32_t get_allocation_count();
   std::vector<std::string> get_awake_instances();
+  // Get instances in WAKEUP or ALLOCATED state (includes in-flight wakeups)
+  std::vector<std::string> get_active_instances();
   // Get awake instances that are not locked (can be evicted)
   std::vector<std::string> get_unlocked_instances();
   // Atomically get awake instances and lock all of them, returns locked instance list
@@ -105,7 +107,8 @@ class ModelInstanceMgr {
  private:
   bool send_http_request(std::shared_ptr<brpc::Channel> channel,
                          const std::string& uri,
-                         const std::string& request_body);
+                         const std::string& request_body,
+                         std::string* error_text = nullptr);
 
   // Must be called while holding model_heat_mutex_
   void prune_model_heat_locked();
