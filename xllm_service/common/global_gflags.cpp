@@ -162,6 +162,11 @@ DEFINE_bool(disable_steady_pool,
             "When true, disable steady pool entirely. All models are assigned "
             "to the elastic pool with PD disaggregation enabled.");
 
+DEFINE_bool(disable_elastic_pool,
+            false,
+            "When true, disable elastic pool entirely. All models are assigned "
+            "to the steady pool only, no PD disaggregation or dynamic scaling.");
+
 DEFINE_int32(elastic_instance_count,
              0,
              "Fixed number of instances per model when disable_steady_pool is "

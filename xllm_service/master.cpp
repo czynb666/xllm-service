@@ -201,7 +201,14 @@ int main(int argc, char* argv[]) {
       .slo_penalty_factor(FLAGS_slo_penalty_factor)
       .max_slo_expansions(FLAGS_max_slo_expansions)
       .disable_steady_pool(FLAGS_disable_steady_pool)
+      .disable_elastic_pool(FLAGS_disable_elastic_pool)
       .elastic_instance_count(FLAGS_elastic_instance_count);
+
+  if (options.disable_steady_pool() && options.disable_elastic_pool()) {
+    LOG(ERROR) << "disable_steady_pool and disable_elastic_pool cannot both "
+               << "be true.";
+    return -1;
+  }
 
   if (options.disable_steady_pool()) {
     LOG(INFO) << "Steady pool DISABLED: all models will use elastic pool "
@@ -224,6 +231,11 @@ int main(int argc, char* argv[]) {
       LOG(INFO) << "Elastic scaling DISABLED: using ALL available instances "
                 << "per model.";
     }
+  }
+
+  if (options.disable_elastic_pool()) {
+    LOG(INFO) << "Elastic pool DISABLED: all models will use steady pool only, "
+              << "no PD disaggregation or dynamic scaling.";
   }
 
   xllm_service::Master master(options);

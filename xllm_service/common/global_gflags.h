@@ -89,4 +89,6 @@ DECLARE_string(gp_dynamic_data_path);
 
 DECLARE_bool(disable_steady_pool);
 
+DECLARE_bool(disable_elastic_pool);
+
 DECLARE_int32(elastic_instance_count);

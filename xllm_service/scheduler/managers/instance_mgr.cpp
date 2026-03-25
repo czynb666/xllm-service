@@ -125,21 +125,23 @@ void InstanceMgr::init() {
     });
   }
 
-  // Start dedicated auto-scaling thread
-  static constexpr int kAutoScalingIntervalMs = 500;
-  auto_scaling_thread_ = std::make_unique<std::thread>([this]() {
-    while (!exited_) {
-      {
-        std::unique_lock<std::mutex> lock(scaling_trigger_mutex_);
-        scaling_trigger_cv_.wait_for(
-            lock, std::chrono::milliseconds(kAutoScalingIntervalMs),
-            [this] { return scaling_requested_ || exited_; });
-        scaling_requested_ = false;
+  // Start dedicated auto-scaling thread (skip if elastic pool disabled)
+  if (!options_.disable_elastic_pool()) {
+    static constexpr int kAutoScalingIntervalMs = 500;
+    auto_scaling_thread_ = std::make_unique<std::thread>([this]() {
+      while (!exited_) {
+        {
+          std::unique_lock<std::mutex> lock(scaling_trigger_mutex_);
+          scaling_trigger_cv_.wait_for(
+              lock, std::chrono::milliseconds(kAutoScalingIntervalMs),
+              [this] { return scaling_requested_ || exited_; });
+          scaling_requested_ = false;
+        }
+        if (exited_) break;
+        try_dynamic_part_auto_scaling();
       }
-      if (exited_) break;
-      try_dynamic_part_auto_scaling();
-    }
-  });
+    });
+  }
 
   // Start low-frequency P/D metrics thread.
   static constexpr int kPdMetricsIntervalSeconds = 1;
@@ -1781,6 +1783,10 @@ void InstanceMgr::request_cold_elastic_wakeup(const std::string& model_id) {
 }
 
 void InstanceMgr::dynamic_part_auto_scaling_impl() {
+  if (options_.disable_elastic_pool()) {
+    return;
+  }
+
   int32_t total_gpus = total_available_gpus_.load();
   int32_t raw_budget = std::max(0, total_gpus - steady_needed_gpus());
 
@@ -2578,6 +2584,36 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
     return;
   }
 
+  // When elastic pool is disabled, force steady pool assignment
+  if (options_.disable_elastic_pool()) {
+    ResourceNeeds needs = get_model_resource_needs(model_id);
+    std::string instance = find_or_create_steady_bin(model_id, needs);
+    if (instance.empty()) {
+      LOG(WARNING) << "assign_model_to_pool: no instance for steady pool, "
+                   << "model " << model_id << " unassigned (elastic disabled)";
+      return;
+    }
+
+    model_pool_assignments_[model_id] = PoolType::STEADY;
+    uint64_t model_size = get_model_size_bytes(model_id);
+    model_mgr->set_model_state(instance, ModelState::ALLOCATED);
+    deduct_free_pages(instance, model_size);
+    {
+      std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+      instance_tag_map_[instance] = InstanceTag::NORMAL;
+      LOG(INFO) << "Tag change: instance " << instance
+                << " -> NORMAL (steady assign, elastic pool disabled, model "
+                << model_id << ")";
+    }
+
+    alloc_lock.unlock();
+    send_model_wakeup(instance, model_id, true);
+
+    LOG(INFO) << "assign_model_to_pool: model=" << model_id
+              << " -> STEADY on " << instance << " (elastic pool disabled)";
+    return;
+  }
+
   int64_t heat = model_mgr->get_model_heat();
   auto res_it = model_resource_models_.find(model_id);
   int32_t gpu_target = (heat == 0) ? 1
@@ -2872,6 +2908,9 @@ InstanceMgr::remove_model_from_steady_bin(const std::string& model_id) {
 
 bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
   if (options_.disable_steady_pool()) {
+    return false;
+  }
+  if (options_.disable_elastic_pool()) {
     return false;
   }
 
@@ -3178,6 +3217,9 @@ void InstanceMgr::steady_part_auto_repacking() {
 
 void InstanceMgr::elastic_to_steady_demotion() {
   if (options_.disable_steady_pool()) {
+    return;
+  }
+  if (options_.disable_elastic_pool()) {
     return;
   }
 
