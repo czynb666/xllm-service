@@ -76,6 +76,10 @@ class GaussianProcess {
   Eigen::MatrixXd X_train_;  // (N x D)
   Eigen::VectorXd y_train_;  // (N,)
 
+  // Training data bounds for input clamping (prevents extrapolation collapse)
+  Eigen::VectorXd x_min_;  // (D,) per-dimension minimum of X_train
+  Eigen::VectorXd x_max_;  // (D,) per-dimension maximum of X_train
+
   // Precomputed for fast prediction
   Eigen::LLT<Eigen::MatrixXd> llt_;  // Cholesky of K_train + noise*I
   Eigen::VectorXd alpha_;             // K_train^{-1} * y_train

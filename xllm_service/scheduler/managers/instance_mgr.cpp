@@ -1369,13 +1369,13 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
   }
 }
 
-void InstanceMgr::send_model_wakeup(const std::string& instance_name,
+bool InstanceMgr::send_model_wakeup(const std::string& instance_name,
                                     const std::string& model_id,
                                     bool memory_increased_in_advance) {
 
   if (instance_name.empty() || instance_name == "all") {
     LOG(ERROR) << "Only support fixed instance_name for model trigger now.";
-    return;
+    return false;
   }
 
   auto model_mgr = get_model_instance_mgr(model_id);
@@ -1436,6 +1436,7 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
     }
     instance_freed_cv_.notify_all();
   }
+  return wakeup_success;
 }
 
 void InstanceMgr::init_model_memory_specs() {
@@ -2667,12 +2668,18 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
     return;
   }
 
-  int32_t gpu_target = compute_gpu_target_for_model(model_id);
+  // Use token rate threshold to decide pool: if rate exceeds single-instance
+  // capacity (3000 tok/s), the model needs elastic pool with multiple instances.
+  static constexpr double kSingleInstanceCapacity = 3000.0;
+  auto stats = model_mgr->get_traffic_stats();
+  bool needs_elastic = stats.token_rate > kSingleInstanceCapacity;
 
   LOG(INFO) << "assign_model_to_pool: model=" << model_id
-            << " gpu_target=" << gpu_target;
+            << " token_rate=" << stats.token_rate
+            << " threshold=" << kSingleInstanceCapacity
+            << " -> " << (needs_elastic ? "ELASTIC" : "STEADY");
 
-  if (gpu_target <= 1) {
+  if (!needs_elastic) {
     // Steady pool
     ResourceNeeds needs = get_model_resource_needs(model_id);
 
@@ -2743,7 +2750,7 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
     } else {
       model_pool_assignments_[model_id] = PoolType::ELASTIC;
       LOG(INFO) << "Assigned model " << model_id
-                << " to ELASTIC pool (gpu_target=" << gpu_target << ")";
+                << " to ELASTIC pool";
     }
   }
 }
@@ -2969,9 +2976,10 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
   auto model_mgr = get_model_instance_mgr(model_id);
   if (!model_mgr) return false;
 
-  int32_t gpu_target = compute_gpu_target_for_model(model_id);
-
-  if (gpu_target <= 1) {
+  // Use token rate threshold (same as assign_model_to_pool)
+  static constexpr double kSingleInstanceCapacity = 3000.0;
+  auto stats = model_mgr->get_traffic_stats();
+  if (stats.token_rate <= kSingleInstanceCapacity) {
     return false;  // still fits in steady pool
   }
 
@@ -3013,8 +3021,7 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
 
   alloc_lock.unlock();
 
-  LOG(INFO) << "Upgrading model " << model_id << " from STEADY to ELASTIC pool "
-            << "(gpu_target=" << gpu_target << ")";
+  LOG(INFO) << "Upgrading model " << model_id << " from STEADY to ELASTIC pool ";
 
   // Async: drain + sleep the model on old steady instance
   if (!steady_instance.empty()) {
@@ -3043,7 +3050,13 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
       LOG(INFO) << "Tag change: instance " << new_inst
                 << " -> NORMAL (R(B) repack for model " << mid << ")";
     }
-    send_model_wakeup(new_inst, mid, false);
+    bool wakeup_ok = send_model_wakeup(new_inst, mid, false);
+    if (!wakeup_ok) {
+      LOG(WARNING) << "R(B) repack: wakeup failed for " << mid
+                   << " on " << new_inst
+                   << ", keeping old instance " << old_inst;
+      continue;
+    }
     if (mgr) mgr->set_model_state(old_inst, ModelState::DRAINING);
     wait_for_model_drain(old_inst, mid);
     send_model_sleep(old_inst, mid);
@@ -3248,7 +3261,13 @@ void InstanceMgr::steady_part_auto_repacking() {
       LOG(INFO) << "Tag change: instance " << new_inst
                 << " -> NORMAL (steady repack for model " << model_id << ")";
     }
-    send_model_wakeup(new_inst, model_id, false);
+    bool wakeup_ok = send_model_wakeup(new_inst, model_id, false);
+    if (!wakeup_ok) {
+      LOG(WARNING) << "steady_part_auto_repacking: wakeup failed for "
+                   << model_id << " on " << new_inst
+                   << ", keeping old instance " << old_inst;
+      continue;
+    }
     if (mgr) mgr->set_model_state(old_inst, ModelState::DRAINING);
     wait_for_model_drain(old_inst, model_id);
     send_model_sleep(old_inst, model_id);

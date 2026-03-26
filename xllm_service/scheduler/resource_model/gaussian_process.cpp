@@ -31,7 +31,9 @@ GaussianProcess::GaussianProcess(const Eigen::MatrixXd& X_train,
       signal_variance_(signal_variance),
       noise_variance_(noise_variance),
       X_train_(X_train),
-      y_train_(y_train) {
+      y_train_(y_train),
+      x_min_(X_train.colwise().minCoeff()),
+      x_max_(X_train.colwise().maxCoeff()) {
   CHECK_EQ(X_train.rows(), y_train.size())
       << "X_train rows must match y_train size";
   CHECK_EQ(lengthscales.size(), input_dim_)
@@ -68,7 +70,9 @@ GaussianProcess::GaussianProcess(const Eigen::MatrixXd& X_train,
   LOG(INFO) << "GaussianProcess initialized: " << n_train_ << " training points"
             << ", input_dim=" << input_dim_
             << ", signal_var=" << signal_variance_
-            << ", noise_var=" << noise_variance_;
+            << ", noise_var=" << noise_variance_
+            << ", x_min=[" << x_min_.transpose() << "]"
+            << ", x_max=[" << x_max_.transpose() << "]";
 }
 
 double GaussianProcess::rbf_kernel(const Eigen::VectorXd& x1,
@@ -88,13 +92,17 @@ Eigen::VectorXd GaussianProcess::kernel_vector(
 }
 
 double GaussianProcess::predict_mean(const Eigen::VectorXd& x_test) const {
-  Eigen::VectorXd k_star = kernel_vector(x_test);
+  // Clamp input to training data range to prevent extrapolation collapse
+  Eigen::VectorXd x_clamped = x_test.cwiseMax(x_min_).cwiseMin(x_max_);
+  Eigen::VectorXd k_star = kernel_vector(x_clamped);
   return k_star.dot(alpha_);
 }
 
 std::pair<double, double> GaussianProcess::predict(
     const Eigen::VectorXd& x_test) const {
-  Eigen::VectorXd k_star = kernel_vector(x_test);
+  // Clamp input to training data range to prevent extrapolation collapse
+  Eigen::VectorXd x_clamped = x_test.cwiseMax(x_min_).cwiseMin(x_max_);
+  Eigen::VectorXd k_star = kernel_vector(x_clamped);
 
   // Mean: k*^T * alpha
   double mean = k_star.dot(alpha_);

@@ -131,7 +131,7 @@ DEFINE_bool(enable_prefill_only_mode,
             "(prefill-only elastic pool mode).");
 
 DEFINE_double(gpu_hbm_per_gpu_gb,
-              80.0,
+              55.0,
               "HBM capacity per GPU in GB, used for auto-scaling resource model.");
 
 DEFINE_double(gpu_compute_sm_per_gpu,

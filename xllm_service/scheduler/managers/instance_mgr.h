@@ -115,7 +115,7 @@ class InstanceMgr final {
   void send_model_sleep(const std::string& instance_name,
                         const std::string& model_id);
 
-  void send_model_wakeup(const std::string& instance_name,
+  bool send_model_wakeup(const std::string& instance_name,
                          const std::string& model_id,
                          bool memory_increased_in_advance);
 
