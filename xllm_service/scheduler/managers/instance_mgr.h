@@ -440,6 +440,11 @@ class InstanceMgr final {
   // Repack timer thread
   std::unique_ptr<std::thread> repack_thread_;
 
+  // --- Orphan cleanup state (accessed only from log_model_pd_counts thread) ---
+  // Tracks when a model was first detected as orphaned (pool=NONE, heat=0, awake instances)
+  std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+      orphan_detected_time_;
+
   // --- Scaling plan anti-jitter state (protected by allocation_mutex_) ---
   struct ScalingPlanEntry {
     int32_t gpu_allocated = 0;

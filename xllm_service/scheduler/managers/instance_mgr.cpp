@@ -337,6 +337,40 @@ void InstanceMgr::log_model_pd_counts() {
               << " decode=" << decode_count
               << " normal=" << normal_count;
   }
+
+  // --- Orphan cleanup: detect and sleep models stuck in pool=NONE with awake instances ---
+  static constexpr int64_t kOrphanGracePeriodSeconds = 30;
+  for (const auto& [model_id, mgr] : mgrs) {
+    if (!mgr) continue;
+    const auto it = pool_snapshot.find(model_id);
+    const PoolType pool = (it != pool_snapshot.end()) ? it->second : PoolType::NONE;
+    int64_t heat = mgr->get_model_heat();
+    auto awake_instances = mgr->get_awake_instances();
+
+    if (pool == PoolType::NONE && heat == 0 && !awake_instances.empty()) {
+      auto now = std::chrono::steady_clock::now();
+      auto oit = orphan_detected_time_.find(model_id);
+      if (oit == orphan_detected_time_.end()) {
+        orphan_detected_time_[model_id] = now;
+      } else {
+        auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
+            now - oit->second).count();
+        if (elapsed_s >= kOrphanGracePeriodSeconds) {
+          LOG(WARNING) << "Orphan cleanup: model " << model_id
+                       << " has pool=NONE, heat=0 but "
+                       << awake_instances.size()
+                       << " awake instances for >" << elapsed_s
+                       << "s, sleeping them";
+          for (const auto& inst : awake_instances) {
+            send_model_sleep(inst, model_id);
+          }
+          orphan_detected_time_.erase(model_id);
+        }
+      }
+    } else {
+      orphan_detected_time_.erase(model_id);
+    }
+  }
 }
 
 InstanceMetaInfo InstanceMgr::get_instance_info(
@@ -3075,7 +3109,15 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
     if (!wakeup_ok) {
       LOG(WARNING) << "R(B) repack: wakeup failed for " << mid
                    << " on " << new_inst
-                   << ", keeping old instance " << old_inst;
+                   << ", rolling back and keeping old instance " << old_inst;
+      // Roll back new instance state
+      if (mgr) {
+        mgr->set_model_state(new_inst, ModelState::SLEEP);
+      }
+      if (count_active_models_on_instance(new_inst) == 0) {
+        std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+        instance_tag_map_[new_inst] = InstanceTag::NONE;
+      }
       continue;
     }
     if (mgr) mgr->set_model_state(old_inst, ModelState::DRAINING);
@@ -3253,13 +3295,20 @@ void InstanceMgr::steady_part_auto_repacking() {
   for (const auto& [model_id, instance] : models_to_remove) {
     remove_model_from_steady_bin(model_id);
     model_pool_assignments_.erase(model_id);
-    LOG(INFO) << "steady_part_auto_repacking: sleeping model " << model_id
-              << " on " << instance << " (heat=0)";
-    std::string inst = instance;
-    std::string mid = model_id;
-    std::thread([this, inst, mid]() {
-      send_model_sleep(inst, mid);
-    }).detach();
+    // Query actual awake instances (bin instance may be stale after cascading repacks)
+    auto model_mgr = get_model_instance_mgr(model_id);
+    if (model_mgr) {
+      auto awake_insts = model_mgr->get_awake_instances();
+      for (const auto& awake_inst : awake_insts) {
+        LOG(INFO) << "steady_part_auto_repacking: sleeping model " << model_id
+                  << " on " << awake_inst << " (heat=0)";
+        std::string inst_copy = awake_inst;
+        std::string mid = model_id;
+        std::thread([this, inst_copy, mid]() {
+          send_model_sleep(inst_copy, mid);
+        }).detach();
+      }
+    }
   }
 
   // Phase 2: FFD repack of remaining models
