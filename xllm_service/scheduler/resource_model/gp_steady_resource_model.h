@@ -30,8 +30,7 @@ namespace xllm_service {
 //   GP[2]: 4D input -> per-GPU HBM-to-SRAM bandwidth utilization [0, 1]
 //
 // Input dimensions:
-//   (token_rate, prompt_length_moment1, prompt_length_moment2,
-//    avg_prompt_len * generated_tokens)
+//   (avg_tokens_per_sec, avg_input_len, avg_input_len², avg_output_len)
 class GPSteadyResourceModel final : public ResourceModel {
  public:
   GPSteadyResourceModel(std::unique_ptr<GaussianProcess> gp_hbm,
@@ -47,9 +46,9 @@ class GPSteadyResourceModel final : public ResourceModel {
 
   // Primary GP interface: compute 3D resource needs from traffic stats.
   ResourceNeeds calc_3d_resources(double token_rate,
-                                  double moment1,
-                                  double moment2,
-                                  double decode_pressure) const override;
+                                  double avg_input_len,
+                                  double avg_input_len2,
+                                  double avg_output_len) const override;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(GPSteadyResourceModel);

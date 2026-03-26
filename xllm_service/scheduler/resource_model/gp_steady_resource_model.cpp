@@ -29,10 +29,10 @@ GPSteadyResourceModel::GPSteadyResourceModel(
       gp_bandwidth_(std::move(gp_bandwidth)) {}
 
 ResourceNeeds GPSteadyResourceModel::calc_3d_resources(
-    double token_rate, double moment1, double moment2,
-    double decode_pressure) const {
+    double token_rate, double avg_input_len, double avg_input_len2,
+    double avg_output_len) const {
   Eigen::VectorXd x(4);
-  x << token_rate, moment1, moment2, decode_pressure;
+  x << token_rate, avg_input_len, avg_input_len2, avg_output_len;
 
   ResourceNeeds needs;
   needs.hbm_gb = std::max(gp_hbm_->predict_mean(x), 0.0);

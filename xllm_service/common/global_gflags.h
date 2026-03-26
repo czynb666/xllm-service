@@ -83,6 +83,8 @@ DECLARE_bool(enable_mix_pd);
 
 DECLARE_double(gpu_bandwidth_per_gpu);
 
+DECLARE_string(model_alias_map_path);
+
 DECLARE_string(gp_steady_data_path);
 
 DECLARE_string(gp_dynamic_data_path);

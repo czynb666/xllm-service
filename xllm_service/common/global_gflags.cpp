@@ -147,6 +147,12 @@ DEFINE_double(gpu_bandwidth_per_gpu,
               1.0,
               "HBM-to-SRAM bandwidth capacity per GPU (normalized).");
 
+DEFINE_string(model_alias_map_path,
+              "",
+              "Path to JSON file mapping alias model IDs to real model IDs "
+              "for GP resource model lookup. Format: {\"alias\": \"real\", ...}. "
+              "Empty means no alias mapping (model IDs used as-is).");
+
 DEFINE_string(gp_steady_data_path,
               "",
               "Path to JSON file containing GP training data for steady pool "

@@ -1462,6 +1462,28 @@ void InstanceMgr::init_model_resource_coefficients() {
   gpu_hw_spec_.compute_sm_per_gpu = FLAGS_gpu_compute_sm_per_gpu;
   gpu_hw_spec_.bandwidth_per_gpu = FLAGS_gpu_bandwidth_per_gpu;
 
+  // Load alias-to-real model mapping for GP lookup
+  if (!FLAGS_model_alias_map_path.empty()) {
+    std::ifstream alias_file(FLAGS_model_alias_map_path);
+    if (alias_file.is_open()) {
+      try {
+        nlohmann::json alias_data;
+        alias_file >> alias_data;
+        for (auto it = alias_data.begin(); it != alias_data.end(); ++it) {
+          alias_to_real_model_[it.key()] = it.value().get<std::string>();
+        }
+        LOG(INFO) << "Loaded " << alias_to_real_model_.size()
+                  << " alias-to-real model mappings from "
+                  << FLAGS_model_alias_map_path;
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to parse model alias map: " << e.what();
+      }
+    } else {
+      LOG(ERROR) << "Failed to open model alias map file: "
+                 << FLAGS_model_alias_map_path;
+    }
+  }
+
   // Load GP models from JSON files if paths are provided
   if (!FLAGS_gp_steady_data_path.empty()) {
     load_gp_steady_models(FLAGS_gp_steady_data_path);
@@ -2553,7 +2575,8 @@ ResourceNeeds InstanceMgr::get_model_resource_needs(const std::string& model_id)
   auto model_mgr = get_model_instance_mgr(model_id);
   int64_t heat = model_mgr ? model_mgr->get_model_heat() : 0;
 
-  auto it = model_resource_models_.find(model_id);
+  const auto& gp_id = resolve_gp_model_id(model_id);
+  auto it = model_resource_models_.find(gp_id);
   if (it != model_resource_models_.end()) {
     return it->second->compute_resource_needs(heat);
   }
@@ -2615,7 +2638,8 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
   }
 
   int64_t heat = model_mgr->get_model_heat();
-  auto res_it = model_resource_models_.find(model_id);
+  const auto& gp_id = resolve_gp_model_id(model_id);
+  auto res_it = model_resource_models_.find(gp_id);
   int32_t gpu_target = (heat == 0) ? 1
       : (res_it != model_resource_models_.end())
           ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
@@ -2926,7 +2950,8 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
   if (!model_mgr) return false;
 
   int64_t heat = model_mgr->get_model_heat();
-  auto res_it = model_resource_models_.find(model_id);
+  const auto& gp_id = resolve_gp_model_id(model_id);
+  auto res_it = model_resource_models_.find(gp_id);
   int32_t gpu_target = (res_it != model_resource_models_.end())
       ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
       : 1;
@@ -3248,7 +3273,8 @@ void InstanceMgr::elastic_to_steady_demotion() {
       if (!model_mgr) continue;
 
       int64_t heat = model_mgr->get_model_heat();
-      auto res_it = model_resource_models_.find(model_id);
+      const auto& gp_id = resolve_gp_model_id(model_id);
+      auto res_it = model_resource_models_.find(gp_id);
       int32_t gpu_target = (heat == 0) ? 0
           : (res_it != model_resource_models_.end())
               ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
@@ -3294,7 +3320,8 @@ void InstanceMgr::elastic_to_steady_demotion() {
     }
 
     int64_t heat = model_mgr->get_model_heat();
-    auto res_it = model_resource_models_.find(model_id);
+    const auto& gp_id = resolve_gp_model_id(model_id);
+    auto res_it = model_resource_models_.find(gp_id);
     int32_t gpu_target = (heat == 0) ? 0
         : (res_it != model_resource_models_.end())
             ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)

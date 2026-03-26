@@ -411,8 +411,18 @@ class InstanceMgr final {
   std::unordered_map<std::string, std::unique_ptr<ResourceModel>> model_resource_models_;
   // model_id -> dynamic pool GP resource model (read-only after init)
   std::unordered_map<std::string, std::unique_ptr<ResourceModel>> dynamic_resource_models_;
+  // alias model_id -> real model_id for GP resource model lookup (read-only after init)
+  std::unordered_map<std::string, std::string> alias_to_real_model_;
   // GPU hardware spec (read-only after init)
   GpuHardwareSpec gpu_hw_spec_;
+
+  // Resolve alias model_id to real model_id for GP resource model lookup.
+  // Returns the real model_id if an alias mapping exists, otherwise returns
+  // the input model_id unchanged.
+  const std::string& resolve_gp_model_id(const std::string& model_id) const {
+    auto it = alias_to_real_model_.find(model_id);
+    return (it != alias_to_real_model_.end()) ? it->second : model_id;
+  }
 
   // --- Dual-pool state (protected by allocation_mutex_) ---
   // model_id -> which pool it belongs to
