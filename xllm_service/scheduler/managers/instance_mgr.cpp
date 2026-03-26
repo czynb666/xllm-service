@@ -1440,23 +1440,29 @@ bool InstanceMgr::send_model_wakeup(const std::string& instance_name,
 }
 
 void InstanceMgr::init_model_memory_specs() {
-    // Hardcoded memory specs: x * 2 + 5 GB. 5GB = 3GB KV cache + 2GB overhead
+    // Memory spec per GPU (GB) = weight_bytes / TP / (1024^3) + 5.0 (KV cache + overhead)
+    // Model parameters sourced from janus_data/model_config.py
 
-    // just for test
-    model_memory_specs_["Qwen3-4B"] = 25.0;
-    model_memory_specs_["Qwen2-7B"] = 25.0;
-    model_memory_specs_["Qwen3-8B"] = 25.0;
-    
-
-    // model_memory_specs_["Qwen3-8B"] = 8.0 * 2 + 5.0;// 21.0GB
-    // model_memory_specs_["Qwen2-7B"] = 7.0 * 2 + 5.0;// 19.0GB
-    // model_memory_specs_["Qwen2-7B-Instruct"] = 7.0 * 2 + 5.0;// 19.0GB
-    // model_memory_specs_["Qwen2.5-14B"] = 14.0 * 2 + 5.0;// 33.0GB
-    // model_memory_specs_["Qwen3-4B"] = 4.0 * 2 + 5.0;// 13.0GB
-    // model_memory_specs_["Qwen2.5-3b"] = 3.0 * 2 + 5.0;// 11.0GB
-    // model_memory_specs_["Qwen3-30B-A3B-Instruct-2507"] = 57.0 + 5.0;// 62.0GB
-    // model_memory_specs_["Qwen3-30B-A3B-W8A8"] = 30.0 + 5.0;// 35.0GB
-    // model_memory_specs_["Qwen3-32B-W8A8"] = 40.0 + 5.0;// 45.0GB
+    // Qwen3-0.6B: 0.6B params × bf16 = 1.2 GB, TP=1, per-GPU = 1.2 + 5 = 6.2 GB
+    model_memory_specs_["Qwen3-0.6B"] = 6.2;
+    // Qwen3-1.7B: 1.7B params × bf16 = 3.4 GB, TP=1, per-GPU = 3.4 + 5 = 8.4 GB
+    model_memory_specs_["Qwen3-1.7B"] = 8.4;
+    // Qwen2.5-3B: 3.1B params × bf16 = 6.2 GB, TP=1, per-GPU = 6.2 + 5 = 11.2 GB
+    model_memory_specs_["Qwen2.5-3B"] = 11.2;
+    // Qwen3-4B: 4.0B params × bf16 = 8.0 GB, TP=1, per-GPU = 8.0 + 5 = 13.0 GB
+    model_memory_specs_["Qwen3-4B"] = 13.0;
+    // Qwen2-7B: 7.6B params × bf16 = 15.2 GB, TP=1, per-GPU = 15.2 + 5 = 20.2 GB
+    model_memory_specs_["Qwen2-7B"] = 20.2;
+    // Qwen3-8B: 8.2B params × bf16 = 16.4 GB, TP=1, per-GPU = 16.4 + 5 = 21.4 GB
+    model_memory_specs_["Qwen3-8B"] = 21.4;
+    // Qwen2.5-14B: 14.7B params × bf16 = 29.4 GB, TP=2, per-GPU = 14.7 + 5 = 19.7 GB
+    model_memory_specs_["Qwen2.5-14B"] = 19.7;
+    // Qwen3-32B: 32.8B params × bf16 = 65.6 GB, TP=2, per-GPU = 32.8 + 5 = 37.8 GB
+    model_memory_specs_["Qwen3-32B"] = 37.8;
+    // DeepSeek-V3.2: 671B params × FP8 = 671 GB, TP=16, per-GPU = 41.9 + 5 = 46.9 GB
+    model_memory_specs_["DeepSeek-V3.2"] = 46.9;
+    // GLM-4.5-Air: 112B params × FP8 = 112 GB, TP=16, per-GPU = 7.0 + 5 = 12.0 GB
+    model_memory_specs_["GLM-4.5-Air"] = 12.0;
 }
 
 void InstanceMgr::init_model_resource_coefficients() {
@@ -1620,8 +1626,13 @@ double InstanceMgr::get_model_memory_size(const std::string& model_id) {
     if (model_memory_specs_.count(model_id)) {
         return model_memory_specs_[model_id];
     }
+    // Resolve alias to real model
+    const std::string& real_model_id = resolve_gp_model_id(model_id);
+    if (real_model_id != model_id && model_memory_specs_.count(real_model_id)) {
+        return model_memory_specs_[real_model_id];
+    }
     LOG(WARNING) << "Unknown model ID for memory spec: " << model_id << ", using default 20GB";
-    return 20.0; 
+    return 20.0;
 }
 
 bool InstanceMgr::is_model_waking_up(const std::string& model_id) {
@@ -2319,19 +2330,29 @@ bool InstanceMgr::has_valid_xtensor_info(const std::string& instance_name) {
 }
 
 uint64_t InstanceMgr::get_model_size_bytes(const std::string& model_id) {
-  // Priority 1: Get from any instance's xtensor info
+  // Resolve alias to real model for lookup
+  const std::string& real_model_id = resolve_gp_model_id(model_id);
+
+  // Priority 1: Get from any instance's xtensor info (try both alias and real)
   {
     std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
     for (const auto& [inst_name, info] : instance_xtensor_infos_) {
       if (!info.is_valid) continue;
       uint64_t size = info.get_model_size_bytes(model_id);
       if (size > 0) return size;
+      if (real_model_id != model_id) {
+        size = info.get_model_size_bytes(real_model_id);
+        if (size > 0) return size;
+      }
     }
   }
 
-  // Priority 2: Fallback to model_memory_specs_
+  // Priority 2: Fallback to model_memory_specs_ (try both alias and real)
   if (model_memory_specs_.count(model_id)) {
     return static_cast<uint64_t>(model_memory_specs_[model_id] * 1024 * 1024 * 1024);
+  }
+  if (real_model_id != model_id && model_memory_specs_.count(real_model_id)) {
+    return static_cast<uint64_t>(model_memory_specs_[real_model_id] * 1024 * 1024 * 1024);
   }
 
   // Default fallback: 20GB

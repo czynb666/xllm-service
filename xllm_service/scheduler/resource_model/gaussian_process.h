@@ -80,6 +80,9 @@ class GaussianProcess {
   Eigen::VectorXd x_min_;  // (D,) per-dimension minimum of X_train
   Eigen::VectorXd x_max_;  // (D,) per-dimension maximum of X_train
 
+  // Output lower bound: predictions below y_min_ are clamped up to y_min_
+  double y_min_;
+
   // Precomputed for fast prediction
   Eigen::LLT<Eigen::MatrixXd> llt_;  // Cholesky of K_train + noise*I
   Eigen::VectorXd alpha_;             // K_train^{-1} * y_train
