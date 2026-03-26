@@ -41,20 +41,21 @@ limitations under the License.
 namespace xllm_service {
 
 // Compute cosine similarity between item needs vector and bin load vector.
-// Both are normalized to [0,1] by dividing by gpu_hw_spec capacities.
+// HBM is normalized to [0,1] by hw capacity; compute_sm and bandwidth are
+// already per-GPU fractions [0,1] from the GP model.
 // Returns 2.0 (> any valid cosine) if either vector is zero-length.
 static double compute_cos_similarity(
     const ResourceNeeds& needs, const SteadyBin& bin,
     const GpuHardwareSpec& hw) {
-  // Item vector (normalized to [0,1])
+  // Item vector (all in [0,1])
   double v1 = needs.hbm_gb / hw.hbm_per_gpu_gb;
-  double v2 = needs.compute_sm / hw.compute_sm_per_gpu;
-  double v3 = needs.bandwidth / hw.bandwidth_per_gpu;
+  double v2 = needs.compute_sm;   // already [0,1] per GPU
+  double v3 = needs.bandwidth;    // already [0,1] per GPU
 
-  // Bin load vector (normalized): used = capacity - remaining
+  // Bin load vector: used = capacity - remaining
   double s1 = (hw.hbm_per_gpu_gb - bin.remaining_hbm_gb) / hw.hbm_per_gpu_gb;
-  double s2 = (hw.compute_sm_per_gpu - bin.remaining_compute_sm) / hw.compute_sm_per_gpu;
-  double s3 = (hw.bandwidth_per_gpu - bin.remaining_bandwidth) / hw.bandwidth_per_gpu;
+  double s2 = 1.0 - bin.remaining_compute_sm;   // remaining is already [0,1]
+  double s3 = 1.0 - bin.remaining_bandwidth;     // remaining is already [0,1]
 
   double dot = v1 * s1 + v2 * s2 + v3 * s3;
   double norm_v = std::sqrt(v1 * v1 + v2 * v2 + v3 * v3);
@@ -1646,9 +1647,10 @@ std::vector<std::string> InstanceMgr::get_awake_prefill_instances(const std::str
 }
 
 void InstanceMgr::update_model_heat(const std::string& model_id,
-                                    int64_t token_count) {
+                                    int64_t token_count,
+                                    int64_t input_len) {
   auto model_mgr = get_model_instance_mgr(model_id);
-  model_mgr->update_model_heat(token_count);
+  model_mgr->update_model_heat(token_count, input_len);
 }
 
 int32_t InstanceMgr::get_wakeup_count(const std::string& model_id) {
@@ -2573,15 +2575,43 @@ int32_t InstanceMgr::compute_elastic_gpu_target_from_rate(double avg_token_rate)
 
 ResourceNeeds InstanceMgr::get_model_resource_needs(const std::string& model_id) {
   auto model_mgr = get_model_instance_mgr(model_id);
-  int64_t heat = model_mgr ? model_mgr->get_model_heat() : 0;
+  auto stats = model_mgr ? model_mgr->get_traffic_stats()
+                         : ModelInstanceMgr::TrafficStats{};
 
   const auto& gp_id = resolve_gp_model_id(model_id);
   auto it = model_resource_models_.find(gp_id);
   if (it != model_resource_models_.end()) {
-    return it->second->compute_resource_needs(heat);
+    return it->second->calc_3d_resources(
+        stats.token_rate, stats.avg_input_len,
+        stats.avg_input_len2, stats.avg_output_len);
   }
   // Default: use hbm_b=20GB, compute_b=0, bandwidth=0 for unknown models
   return {20.0, 0.0, 0.0};
+}
+
+int32_t InstanceMgr::compute_gpu_target_for_model(const std::string& model_id) {
+  auto model_mgr = get_model_instance_mgr(model_id);
+  if (!model_mgr) return 1;
+
+  auto stats = model_mgr->get_traffic_stats();
+  if (stats.token_rate <= 0.0) return 1;
+
+  const auto& gp_id = resolve_gp_model_id(model_id);
+  auto it = model_resource_models_.find(gp_id);
+  if (it == model_resource_models_.end()) return 1;
+
+  ResourceNeeds needs = it->second->calc_3d_resources(
+      stats.token_rate, stats.avg_input_len,
+      stats.avg_input_len2, stats.avg_output_len);
+
+  // HBM needs normalization; compute_sm and bandwidth are already [0,1] per GPU
+  double hbm_gpus = needs.hbm_gb / gpu_hw_spec_.hbm_per_gpu_gb;
+  double compute_gpus = needs.compute_sm;
+  double bandwidth_gpus = needs.bandwidth;
+
+  int32_t target = static_cast<int32_t>(
+      std::ceil(std::max({hbm_gpus, compute_gpus, bandwidth_gpus})));
+  return std::max(target, 1);
 }
 
 void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
@@ -2637,22 +2667,14 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
     return;
   }
 
-  int64_t heat = model_mgr->get_model_heat();
-  const auto& gp_id = resolve_gp_model_id(model_id);
-  auto res_it = model_resource_models_.find(gp_id);
-  int32_t gpu_target = (heat == 0) ? 1
-      : (res_it != model_resource_models_.end())
-          ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
-          : 1;
+  int32_t gpu_target = compute_gpu_target_for_model(model_id);
 
   LOG(INFO) << "assign_model_to_pool: model=" << model_id
-            << " heat=" << heat << " gpu_target=" << gpu_target;
+            << " gpu_target=" << gpu_target;
 
   if (gpu_target <= 1) {
     // Steady pool
-    ResourceNeeds needs = (res_it != model_resource_models_.end())
-        ? res_it->second->compute_resource_needs(heat)
-        : ResourceNeeds{20.0, 0.0, 0.0};
+    ResourceNeeds needs = get_model_resource_needs(model_id);
 
     std::string instance = find_or_create_steady_bin(model_id, needs);
     if (instance.empty()) {
@@ -2691,9 +2713,7 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
                 << model_id << " (free=" << free_for_elastic
                 << " < 2), falling back to STEADY";
 
-      ResourceNeeds needs = (res_it != model_resource_models_.end())
-          ? res_it->second->compute_resource_needs(heat)
-          : ResourceNeeds{20.0, 0.0, 0.0};
+      ResourceNeeds needs = get_model_resource_needs(model_id);
 
       std::string instance = find_or_create_steady_bin(model_id, needs);
       if (instance.empty()) {
@@ -2949,12 +2969,7 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
   auto model_mgr = get_model_instance_mgr(model_id);
   if (!model_mgr) return false;
 
-  int64_t heat = model_mgr->get_model_heat();
-  const auto& gp_id = resolve_gp_model_id(model_id);
-  auto res_it = model_resource_models_.find(gp_id);
-  int32_t gpu_target = (res_it != model_resource_models_.end())
-      ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
-      : 1;
+  int32_t gpu_target = compute_gpu_target_for_model(model_id);
 
   if (gpu_target <= 1) {
     return false;  // still fits in steady pool
@@ -3272,13 +3287,9 @@ void InstanceMgr::elastic_to_steady_demotion() {
       auto model_mgr = get_model_instance_mgr(model_id);
       if (!model_mgr) continue;
 
-      int64_t heat = model_mgr->get_model_heat();
-      const auto& gp_id = resolve_gp_model_id(model_id);
-      auto res_it = model_resource_models_.find(gp_id);
-      int32_t gpu_target = (heat == 0) ? 0
-          : (res_it != model_resource_models_.end())
-              ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
-              : 1;
+      int32_t gpu_target = compute_gpu_target_for_model(model_id);
+      // treat zero-rate as 0 target (model is idle)
+      if (model_mgr->get_model_heat() == 0) gpu_target = 0;
 
       if (gpu_target != 1) {
         // Demand is not "low but nonzero" — reset tracking
@@ -3319,13 +3330,8 @@ void InstanceMgr::elastic_to_steady_demotion() {
       continue;
     }
 
-    int64_t heat = model_mgr->get_model_heat();
-    const auto& gp_id = resolve_gp_model_id(model_id);
-    auto res_it = model_resource_models_.find(gp_id);
-    int32_t gpu_target = (heat == 0) ? 0
-        : (res_it != model_resource_models_.end())
-            ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
-            : 1;
+    int32_t gpu_target = compute_gpu_target_for_model(model_id);
+    if (model_mgr->get_model_heat() == 0) gpu_target = 0;
     if (gpu_target != 1) {
       elastic_low_demand_since_.erase(model_id);
       continue;

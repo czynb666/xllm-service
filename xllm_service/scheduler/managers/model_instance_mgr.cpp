@@ -514,11 +514,15 @@ std::vector<std::string> ModelInstanceMgr::get_awake_instances_and_lock() {
   return awake_instances;
 }
 
-void ModelInstanceMgr::update_model_heat(int64_t token_count) {
+void ModelInstanceMgr::update_model_heat(int64_t token_count, int64_t input_len) {
   std::lock_guard<std::mutex> heat_lock(model_heat_mutex_);
   prune_model_heat_locked();
-  model_heat_records_.push_back({std::chrono::steady_clock::now(), token_count});
+  model_heat_records_.push_back(
+      {std::chrono::steady_clock::now(), token_count, input_len});
   model_heat_ += token_count;
+  total_input_len_ += input_len;
+  total_input_len2_ += input_len * input_len;
+  request_count_ += 1;
 }
 
 int64_t ModelInstanceMgr::get_model_heat() {
@@ -542,6 +546,25 @@ double ModelInstanceMgr::get_avg_token_rate(int window_seconds) {
   return static_cast<double>(total_tokens) / window_seconds;
 }
 
+ModelInstanceMgr::TrafficStats ModelInstanceMgr::get_traffic_stats() {
+  std::lock_guard<std::mutex> heat_lock(model_heat_mutex_);
+  prune_model_heat_locked();
+
+  TrafficStats stats;
+  if (kModelHeatRetentionSeconds > 0) {
+    stats.token_rate =
+        static_cast<double>(model_heat_) / kModelHeatRetentionSeconds;
+  }
+  if (request_count_ > 0) {
+    stats.avg_input_len =
+        static_cast<double>(total_input_len_) / request_count_;
+    stats.avg_input_len2 =
+        static_cast<double>(total_input_len2_) / request_count_;
+  }
+  // avg_output_len uses default (20.0) — actual tracking TBD
+  return stats;
+}
+
 void ModelInstanceMgr::prune_model_heat_locked() {
   auto& records = model_heat_records_;
   auto now = std::chrono::steady_clock::now();
@@ -549,6 +572,10 @@ void ModelInstanceMgr::prune_model_heat_locked() {
     auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - records.front().timestamp).count();
     if (duration > kModelHeatRetentionSeconds) {
       model_heat_ -= records.front().token_count;
+      int64_t il = records.front().input_len;
+      total_input_len_ -= il;
+      total_input_len2_ -= il * il;
+      request_count_ -= 1;
       records.pop_front();
     } else {
       break;
@@ -557,6 +584,11 @@ void ModelInstanceMgr::prune_model_heat_locked() {
   if (model_heat_ < 0) {
     LOG(WARNING) << "ModelInstanceMgr::prune_model_heat_locked: model_heat_ < 0, reset to 0.";
     model_heat_ = 0;
+  }
+  if (request_count_ < 0) {
+    request_count_ = 0;
+    total_input_len_ = 0;
+    total_input_len2_ = 0;
   }
 }
 

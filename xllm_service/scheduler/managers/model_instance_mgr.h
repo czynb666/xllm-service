@@ -96,9 +96,18 @@ class ModelInstanceMgr {
   bool can_sleep(const std::string& instance_name);
   int32_t get_d2d_ref_count(const std::string& instance_name);
 
-  void update_model_heat(int64_t token_count);
+  void update_model_heat(int64_t token_count, int64_t input_len);
   int64_t get_model_heat();
   double get_avg_token_rate(int window_seconds);
+
+  // Traffic statistics for GP resource model (4D input).
+  struct TrafficStats {
+    double token_rate = 0.0;       // tokens/sec
+    double avg_input_len = 0.0;    // average prompt length (tokens)
+    double avg_input_len2 = 0.0;   // average of prompt_length²
+    double avg_output_len = 20.0;  // default; actual tracking TBD
+  };
+  TrafficStats get_traffic_stats();
 
   std::shared_mutex* get_instance_state_single_mutex(const std::string& instance_name);
 
@@ -154,11 +163,15 @@ class ModelInstanceMgr {
   struct HeatRecord {
     std::chrono::steady_clock::time_point timestamp;
     int64_t token_count;
+    int64_t input_len;
   };
   static constexpr int64_t kModelHeatRetentionSeconds = 15;
   std::mutex model_heat_mutex_;
   std::deque<HeatRecord> model_heat_records_;
   int64_t model_heat_ = 0;
+  int64_t total_input_len_ = 0;
+  int64_t total_input_len2_ = 0;
+  int64_t request_count_ = 0;
 
   // D2D reference counting - protects source instances during D2D transfer
   std::mutex d2d_ref_mutex_;

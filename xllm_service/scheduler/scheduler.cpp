@@ -124,7 +124,8 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
 
   // Update model heat
   if (request->prompt.size() != 0) {
-    instance_mgr_->update_model_heat(request->model, request->token_ids.size());
+    instance_mgr_->update_model_heat(request->model, request->token_ids.size(),
+                                     request->token_ids.size());
   }
 
   // Push request to queue (all policies go through process_request_queue)

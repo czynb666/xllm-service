@@ -120,7 +120,8 @@ class InstanceMgr final {
                          bool memory_increased_in_advance);
 
   void update_model_heat(const std::string& model_id,
-                         int64_t token_count);
+                         int64_t token_count,
+                         int64_t input_len);
   
   int32_t get_wakeup_count(const std::string& model_id);
 
@@ -246,8 +247,11 @@ class InstanceMgr final {
   std::vector<std::tuple<std::string, std::string, std::string>>
       remove_model_from_steady_bin(const std::string& model_id);
 
-  // Get resource needs for a model using its current heat.
+  // Get resource needs for a model using its current traffic stats (GP 4D input).
   ResourceNeeds get_model_resource_needs(const std::string& model_id);
+
+  // Compute GPU target using traffic stats (preferred over legacy heat-only interface).
+  int32_t compute_gpu_target_for_model(const std::string& model_id);
 
   // Check if instance is in the steady pool
   bool is_steady_pool_instance(const std::string& instance_name);
