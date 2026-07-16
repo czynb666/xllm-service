@@ -19,7 +19,10 @@ limitations under the License.
 #include <etcd/SyncClient.hpp>
 #include <etcd/Watcher.hpp>
 #include <etcd/v3/Transaction.hpp>
+#include <map>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "common/hash_util.h"
@@ -157,7 +160,9 @@ class EtcdClient {
   std::string etcd_namespace_prefix_;
   std::mutex watchers_mutex_;
   std::map<std::string, WatcherInfo> watchers_;
-  std::vector<std::shared_ptr<etcd::KeepAlive>> keep_alives_;
+  std::mutex keep_alives_mutex_;
+  std::unordered_map<std::string, std::shared_ptr<etcd::KeepAlive>>
+      keep_alives_;
 };
 
 }  // namespace xllm_service

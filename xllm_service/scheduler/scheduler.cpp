@@ -133,6 +133,9 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
                                    std::placeholders::_2);
     etcd_client_->add_watch(ETCD_MASTER_SERVICE_KEY, handle_master);
   }
+
+  registration_reconcile_thread_ = std::make_unique<std::thread>(
+      &Scheduler::reconcile_current_service_registration_loop, this);
 }
 
 Scheduler::~Scheduler() {
@@ -142,6 +145,10 @@ Scheduler::~Scheduler() {
   }
   if (heartbeat_thread_ && heartbeat_thread_->joinable()) {
     heartbeat_thread_->join();
+  }
+  if (registration_reconcile_thread_ &&
+      registration_reconcile_thread_->joinable()) {
+    registration_reconcile_thread_->join();
   }
   lb_policy_.reset();
   instance_mgr_.reset();
@@ -215,6 +222,7 @@ void Scheduler::update_master_service_heartbeat() {
 }
 
 bool Scheduler::register_current_service() {
+  std::lock_guard<std::mutex> lock(registration_mutex_);
   const std::string service_key =
       ETCD_XSERVICE_KEY_PREFIX + options_.service_name();
 
@@ -228,6 +236,40 @@ bool Scheduler::register_current_service() {
              << ". Please ensure service_name is unique across xllm_service "
                 "instances.";
   return false;
+}
+
+bool Scheduler::reconcile_current_service_registration() {
+  std::lock_guard<std::mutex> lock(registration_mutex_);
+  const std::string service_key =
+      ETCD_XSERVICE_KEY_PREFIX + options_.service_name();
+
+  std::string registered_service;
+  if (etcd_client_->get(service_key, &registered_service) &&
+      registered_service == options_.service_name()) {
+    return true;
+  }
+
+  LOG(WARNING) << "Detected missing xllm_service registration in etcd, "
+                  "re-registering: "
+               << service_key;
+  if (etcd_client_->set(
+          service_key, options_.service_name(), kHeartbeatInterval)) {
+    return true;
+  }
+
+  LOG(ERROR) << "Failed to reconcile xllm_service registration in etcd: "
+             << service_key;
+  return false;
+}
+
+void Scheduler::reconcile_current_service_registration_loop() {
+  while (!exited_.load()) {
+    std::this_thread::sleep_for(std::chrono::seconds(kHeartbeatInterval));
+    if (exited_.load()) {
+      return;
+    }
+    reconcile_current_service_registration();
+  }
 }
 
 bool Scheduler::handle_instance_heartbeat(const proto::HeartbeatRequest* req) {
@@ -288,25 +330,22 @@ void Scheduler::handle_xservice_watch(const etcd::Response& response,
       continue;
     }
 
-    std::string deleted_service;
-    if (event.has_prev_kv()) {
-      deleted_service = event.prev_kv().key().substr(prefix_len);
-    } else if (event.has_kv()) {
-      deleted_service = event.kv().key().substr(prefix_len);
-    }
+    const std::string deleted_service_name =
+        get_event_key_suffix(event, prefix_len);
 
-    if (deleted_service.empty()) {
+    if (deleted_service_name.empty()) {
       continue;
     }
 
-    if (deleted_service == ETCD_XSERVICE_KEY_PREFIX + options_.service_name()) {
+    if (deleted_service_name == options_.service_name()) {
       LOG(INFO) << "Current xllm_service registration expired, re-registering";
-      register_current_service();
+      reconcile_current_service_registration();
       continue;
     }
 
     if (!options_.enable_peer_service()) {
-      if (deleted_service == ETCD_MASTER_SERVICE_KEY) {
+      if (ETCD_XSERVICE_KEY_PREFIX + deleted_service_name ==
+          ETCD_MASTER_SERVICE_KEY) {
         continue;
       }
 
@@ -315,7 +354,7 @@ void Scheduler::handle_xservice_watch(const etcd::Response& response,
       }
     }
 
-    LOG(INFO) << "Detected xllm_service offline: " << deleted_service;
+    LOG(INFO) << "Detected xllm_service offline: " << deleted_service_name;
   }
 }
 

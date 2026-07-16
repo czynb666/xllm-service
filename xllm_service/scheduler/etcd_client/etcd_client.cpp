@@ -90,7 +90,21 @@ std::string EtcdClient::namespaced_key(const std::string& logical_key) const {
                                               logical_key);
 }
 
-EtcdClient::~EtcdClient() { stop_watch(); }
+EtcdClient::~EtcdClient() {
+  stop_watch();
+
+  std::unordered_map<std::string, std::shared_ptr<etcd::KeepAlive>>
+      keep_alives;
+  {
+    std::lock_guard<std::mutex> lock(keep_alives_mutex_);
+    keep_alives.swap(keep_alives_);
+  }
+  for (auto& [key, keep_alive] : keep_alives) {
+    if (keep_alive != nullptr) {
+      keep_alive->Cancel();
+    }
+  }
+}
 
 bool EtcdClient::set(const std::string& key, const std::string& value) {
   auto response = client_.put(namespaced_key(key), value);
@@ -106,12 +120,21 @@ bool EtcdClient::set(const std::string& key,
                      const std::string& value,
                      const int ttl) {
   auto keep_alive = std::make_shared<etcd::KeepAlive>(client_, ttl);
-  etcdv3::Transaction transaction;
-  transaction.add_compare_create(namespaced_key(key), 0);
-  transaction.add_success_put(namespaced_key(key), value, keep_alive->Lease());
-  etcd::Response response = client_.txn(transaction);
+  etcd::Response response =
+      client_.add(namespaced_key(key), value, keep_alive->Lease());
   if (response.is_ok()) {
-    keep_alives_.emplace_back(std::move(keep_alive));
+    std::shared_ptr<etcd::KeepAlive> old_keep_alive;
+    {
+      std::lock_guard<std::mutex> lock(keep_alives_mutex_);
+      auto it = keep_alives_.find(key);
+      if (it != keep_alives_.end()) {
+        old_keep_alive = it->second;
+      }
+      keep_alives_[key] = keep_alive;
+    }
+    if (old_keep_alive != nullptr) {
+      old_keep_alive->Cancel();
+    }
     return true;
   } else {
     keep_alive->Cancel();
