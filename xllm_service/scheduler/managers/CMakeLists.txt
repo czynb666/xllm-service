@@ -24,3 +24,20 @@ cc_library(
     proto_xllm
 )
 target_link_libraries(managers PRIVATE brpc-static cppzmq)
+
+# Phase 3 §3.3-2: unit tests for GlobalKVCacheMgr::match() (built only with
+# -DBUILD_TESTING=ON; cc_test is a no-op otherwise).
+cc_test(
+  NAME
+    global_kvcache_mgr_match_test
+  SRCS
+    global_kvcache_mgr_match_test.cpp
+  DEPS
+    :managers
+    :common
+    :etcd_client
+    GTest::gtest_main
+    glog::glog
+    proto::proto_rpc_service
+)
+target_link_libraries(global_kvcache_mgr_match_test PRIVATE brpc-static cppzmq)

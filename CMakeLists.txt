@@ -140,6 +140,7 @@ find_package(ZeroMQ CONFIG REQUIRED)
 find_package(cppzmq CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
+include(GoogleTest)  # provides gtest_add_tests() used by cmake/cc_test.cmake
 find_package(nlohmann_json CONFIG REQUIRED)
 
 if (USE_CXX11_ABI)
