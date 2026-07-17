@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include <atomic>
+
 #include <nlohmann/json.hpp>
 
 #include "chat_template/jinja_chat_template.h"
@@ -102,6 +104,10 @@ class Scheduler final {
 
   bool register_current_service();
 
+  bool reconcile_current_service_registration();
+
+  void reconcile_current_service_registration_loop();
+
   void handle_master_service_watch(const etcd::Response& response,
                                    const uint64_t& prefix_len);
 
@@ -113,7 +119,7 @@ class Scheduler final {
  private:
   Options options_;
 
-  bool exited_ = false;
+  std::atomic_bool exited_{false};
   bool is_master_service_ = false;
 
   TokenizerArgs tokenizer_args_;
@@ -131,6 +137,8 @@ class Scheduler final {
 
   std::unique_ptr<LoadBalancePolicy> lb_policy_;
   std::unique_ptr<std::thread> heartbeat_thread_;
+  std::unique_ptr<std::thread> registration_reconcile_thread_;
+  std::mutex registration_mutex_;
 
   // `service request id` -> `request` map
   std::unordered_map<std::string, std::shared_ptr<Request>> requests_;
